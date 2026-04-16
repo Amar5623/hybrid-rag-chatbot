@@ -1,0 +1,27 @@
+# rag-backend/.dockerignore
+# Keeps the build context small — Docker won't send these to the daemon.
+
+# Virtual environment — dependencies come from requirements.txt
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data directories — these are mounted as volumes, not baked into the image.
+# Baking them in would mean your indexed documents live inside the image,
+# which is wrong — data and code should be separate.
+data/
+
+# Development / editor files
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Git
+.git/
+.gitignore

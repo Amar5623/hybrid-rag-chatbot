@@ -1,0 +1,106 @@
+# docker-compose.yml
+# Place this file at the project root, alongside rag-backend/ and rag-frontend/
+#
+# Usage:
+#   Start:   docker compose up --build
+#   Stop:    docker compose down
+#   Logs:    docker compose logs -f
+#   Rebuild: docker compose up --build --force-recreate
+#
+# Access:
+#   App    → http://localhost:80
+#   API    → http://localhost:8000  (direct, for testing)
+
+services:
+
+  # ── Backend (FastAPI) ───────────────────────────────────────
+  backend:
+    build:
+      context: ./rag-backend
+      dockerfile: Dockerfile
+    container_name: docmind-backend
+    restart: unless-stopped
+
+    # Load environment variables from rag-backend/.env
+    # This file is NOT copied into the image (see .dockerignore)
+    # It's read at runtime so secrets never touch the image layer.
+    env_file:
+      - ./rag-backend/.env
+
+    ports:
+      - "8000:8000"    # Expose directly for API testing / Swagger UI
+
+    volumes:
+      # ── Persistent data volumes ──────────────────────────────
+      # These directories live on your host machine under Docker's
+      # volume storage. Data survives container restarts and rebuilds.
+
+      # Qdrant vector database
+      - rag_qdrant:/app/data/qdrant
+
+      # BM25 sparse index + user SQLite DB + file hashes
+      - rag_data:/app/data
+
+      # Extracted PDF images served as static files
+      - rag_images:/app/data/images
+
+      # HuggingFace model cache
+      # Prevents re-downloading the BGE embedding model (~400MB)
+      # every time you rebuild the image.
+      - rag_hf_cache:/app/data/hf_cache
+
+    networks:
+      - docmind
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s    # Give it time to load the embedding model
+
+
+  # ── Frontend (React + nginx) ────────────────────────────────
+  frontend:
+    build:
+      context: ./rag-frontend
+      dockerfile: Dockerfile
+    container_name: docmind-frontend
+    restart: unless-stopped
+
+    ports:
+      - "80:80"    # App accessible at http://localhost
+
+    depends_on:
+      backend:
+        condition: service_healthy    # Wait for backend to be ready
+
+    networks:
+      - docmind
+
+
+# ── Named volumes ────────────────────────────────────────────
+# Docker manages these on your host. To see where they live:
+#   docker volume inspect docmind_rag_qdrant
+#
+# To back up your data:
+#   docker run --rm -v docmind_rag_data:/data -v $(pwd):/backup \
+#     alpine tar czf /backup/rag_data_backup.tar.gz /data
+#
+# To wipe everything and start fresh:
+#   docker compose down -v
+
+volumes:
+  rag_qdrant:
+  rag_data:
+  rag_images:
+  rag_hf_cache:
+
+
+# ── Network ──────────────────────────────────────────────────
+# Internal bridge network — containers talk to each other by
+# service name (e.g. "backend") not by IP address.
+# Only the ports listed above are exposed to your host machine.
+networks:
+  docmind:
+    driver: bridge

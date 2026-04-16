@@ -1,0 +1,12 @@
+# rag-frontend/.dockerignore
+
+node_modules/
+dist/
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/
+.git/
+.gitignore
