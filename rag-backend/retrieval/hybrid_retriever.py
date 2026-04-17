@@ -1,13 +1,25 @@
 # retrieval/hybrid_retriever.py
 #
-# CHANGES vs original:
-#   - retrieve() now accepts is_offline: bool flag
-#   - In offline mode, reranker step is skipped entirely
-#     (reranker is the heaviest inference step — wrong time to run it
-#     when on battery/limited hardware with no internet).
-#   - Offline pipeline: embed query → BM25 + vector search → RRF fusion
-#     → return top chunks directly. No reranking, no LLM.
-#   - Everything else unchanged.
+# CHANGES vs previous version (Day 2 — A4):
+#   - _expand_to_parents() is NO LONGER called inside retrieve().
+#     retrieve() now always returns raw child chunks (300 tokens each).
+#
+#   WHY THIS MATTERS:
+#     Previously: children → expand to parents → rerank 1500-tok blobs
+#     The reranker was scoring 1500-token parent blobs against a short query.
+#     A dense parent block buries the precise sentence that matched — the
+#     reranker's cross-encoder loses the tight lexical signal it needs.
+#
+#     Now: children → rerank children (precise signal) → expand in rag_chain
+#     The reranker sees 300-token child chunks — exactly the passage that
+#     matched the query. After selecting top-N, rag_chain.py expands those
+#     children to their parent context for the LLM to generate a full answer.
+#
+#   NEW public method: expand_to_parents(retrieval: RetrievalResult) -> RetrievalResult
+#     Called by rag_chain._retrieve() after reranking in online mode.
+#     Offline mode returns child chunks directly (workers see the precise match).
+#
+#   Everything else (RRF, BM25, dedup, filter) unchanged.
 
 import os
 import sys
@@ -68,13 +80,24 @@ class HybridRetriever:
     """
     Hybrid retriever: Dense (cosine) + Sparse (BM25) fused with RRF.
 
-    Online pipeline:
-      embed query → BM25 + vector search → RRF fusion → rerank → top_k
+    Online pipeline (is_offline=False):
+        embed query
+        → BM25 + vector search
+        → RRF fusion
+        → return child chunks
+        [caller: rerank children → expand_to_parents → send to LLM]
 
     Offline pipeline (is_offline=True):
-      embed query → BM25 + vector search → RRF fusion → top_k
-      (reranker skipped — it's the heaviest step and needs no internet
-       but is CPU-intensive, wrong trade-off when running offline)
+        embed query
+        → BM25 + vector search
+        → RRF fusion
+        → return child chunks directly
+        (no reranker, no parent expansion — workers see precise match excerpts)
+
+    KEY CHANGE (Day 2 A4):
+        _expand_to_parents() is no longer called inside retrieve().
+        retrieve() always returns child chunks (300 tokens).
+        Use expand_to_parents(retrieval) AFTER reranking in online mode.
     """
 
     def __init__(
@@ -108,7 +131,7 @@ class HybridRetriever:
             f"  [HYBRID] Ready. "
             f"top_k={top_k} | rrf_k={rrf_k} | "
             f"dense={dense_weight} | sparse={sparse_weight} | "
-            f"parent_expansion=inline"
+            f"parent_expansion=post-rerank (A4)"
         )
 
     # ── INDEX ─────────────────────────────────────────────
@@ -130,18 +153,30 @@ class HybridRetriever:
         is_offline   : bool = False,
     ) -> RetrievalResult:
         """
-        Run hybrid retrieval.
+        Run hybrid retrieval and return RAW CHILD CHUNKS.
+
+        A4 CHANGE: _expand_to_parents() is NO LONGER called here.
+        The returned chunks always contain child content (300 tokens).
+
+        For ONLINE mode:
+            The caller (rag_chain._retrieve) should:
+              1. rerank against these child chunks  ← precise signal
+              2. call self.retriever.expand_to_parents(retrieval)  ← LLM context
+
+        For OFFLINE mode (is_offline=True):
+            Child chunks are returned directly to the user.
+            This is actually BETTER UX — workers see the precise matched
+            passage, not a 1500-token blob they have to read through.
 
         Args:
             query        : search string
             top_k        : override instance default
             filter_field : optional metadata field to filter by
             filter_value : value to match for filter_field
-            is_offline   : if True, skip reranker and return RRF results directly.
-                           The caller (rag_chain) also skips the LLM entirely.
+            is_offline   : flag passed from rag_chain; affects log message only
 
         Returns:
-            RetrievalResult — parent-expanded chunks sorted by RRF (or rerank) score
+            RetrievalResult — child chunks sorted by RRF score
         """
         k       = top_k or self.top_k
         fetch_k = max(k * 3, 20)
@@ -183,23 +218,53 @@ class HybridRetriever:
 
         fused = fused[:k]
 
-        # 5. Parent expansion — inline, no DB needed
-        fused = self._expand_to_parents(fused)
+        # ── A4: NO _expand_to_parents() call here ──────────────
+        # Previously this line existed:
+        #   fused = self._expand_to_parents(fused)
+        # It has been removed. Expansion now happens in rag_chain._retrieve()
+        # AFTER reranking, via self.retriever.expand_to_parents(retrieval).
+        # ────────────────────────────────────────────────────────
 
-        # 6. If offline — return RRF results directly, skip reranker
-        if is_offline:
-            print(f"  [HYBRID] Offline mode — returning {len(fused)} chunks (no reranker)")
-            return RetrievalResult(fused)
-
+        mode = "offline" if is_offline else "online (rerank + expand in chain)"
+        print(f"  [HYBRID] Returning {len(fused)} child chunks ({mode})")
         return RetrievalResult(fused)
 
-    # ── PARENT EXPANSION (inline) ─────────────────────────
+    # ── PARENT EXPANSION (now a public method) ─────────────
+
+    def expand_to_parents(self, retrieval: RetrievalResult) -> RetrievalResult:
+        """
+        PUBLIC wrapper — expands child chunks to parent context.
+
+        Called by rag_chain._retrieve() in ONLINE mode, AFTER reranking.
+        This is the key sequence:
+            1. retrieve()       → 20 children, RRF-sorted
+            2. reranker.rerank()→ top-5 children, cross-encoder scored
+            3. expand_to_parents() → swap child.content for parent_content
+               so the LLM receives the full surrounding passage (~1500 tok)
+
+        Args:
+            retrieval: RetrievalResult of reranked child chunks
+
+        Returns:
+            New RetrievalResult with content replaced by parent_content
+            where available. Deduplicates on parent_id so you never send
+            two children from the same parent section as separate passages.
+        """
+        expanded = self._expand_to_parents(retrieval.get_chunks())
+        print(f"  [HYBRID] Parent expansion: {len(retrieval)} → {len(expanded)} passages")
+        return RetrievalResult(expanded)
+
+    # ── PARENT EXPANSION (private impl) ───────────────────
 
     def _expand_to_parents(self, chunks: list[dict]) -> list[dict]:
         """
         Replace each child's content with its parent_content if available.
         parent_content is stored directly on the Qdrant payload by
         HierarchicalChunker — no SQLite lookup needed.
+
+        Deduplicates on parent_id: if two children share the same parent,
+        only the first (higher-ranked) one is kept. The parent passage
+        already contains both children's text, so there's no info loss.
         """
         expanded     : list[dict] = []
         seen_parents : set        = set()
@@ -212,7 +277,7 @@ class HybridRetriever:
                 if parent_id in seen_parents:
                     continue
                 seen_parents.add(parent_id)
-                merged = {k: v for k, v in child.items()}
+                merged            = {k: v for k, v in child.items()}
                 merged["content"] = parent_content
                 expanded.append(merged)
             else:
@@ -238,14 +303,14 @@ class HybridRetriever:
 
     def get_info(self) -> dict:
         return {
-            "type"         : "HybridRetriever",
-            "top_k"        : self.top_k,
-            "rrf_k"        : self.rrf_k,
-            "dense_weight" : self.dense_weight,
-            "sparse_weight": self.sparse_weight,
-            "deduplicate"  : self.deduplicate,
-            "bm25_docs"    : len(self.bm25),
-            "parent_mode"  : "inline_payload",
+            "type"          : "HybridRetriever",
+            "top_k"         : self.top_k,
+            "rrf_k"         : self.rrf_k,
+            "dense_weight"  : self.dense_weight,
+            "sparse_weight" : self.sparse_weight,
+            "deduplicate"   : self.deduplicate,
+            "bm25_docs"     : len(self.bm25),
+            "parent_mode"   : "post-rerank-expansion (A4)",
         }
 
 
