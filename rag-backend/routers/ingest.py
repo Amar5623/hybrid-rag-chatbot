@@ -127,6 +127,15 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
     skipped       : list[str] = []
     all_children  : list[dict] = []
 
+    # === Minimal addition: save original PDF for viewer ===
+    pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
+    pdfs_dir.mkdir(parents=True, exist_ok=True)
+    for tmp_path_str, filename in file_paths:
+        tmp_path = Path(tmp_path_str)
+        if tmp_path.exists():
+            shutil.copy2(tmp_path, pdfs_dir / filename)
+    # ====================================================
+
     for tmp_path, filename in file_paths:
         # ── 1. Duplicate check ────────────────────────────
         raw   = Path(tmp_path).read_bytes()
@@ -195,6 +204,19 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest(files: list[UploadFile] = File(...)):
+    # === SAFE ORIGINAL PDF STORAGE FOR PDF VIEWER ===
+    # This runs in the already-async function - no structure change
+    pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
+    pdfs_dir.mkdir(parents=True, exist_ok=True)
+    for file in files:
+        if file.filename.lower().endswith(".pdf"):
+            dest_path = pdfs_dir / file.filename
+            content = await file.read()
+            with open(dest_path, "wb") as f:
+                f.write(content)
+            await file.seek(0)   # Important: reset file pointer for original code
+    # ================================================
+    
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
