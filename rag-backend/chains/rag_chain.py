@@ -1,17 +1,13 @@
 # chains/rag_chain.py
 #
-# CHANGES vs original:
-#   - QueryRouter REMOVED — ship workers won't be chatting, they're looking up manuals.
-#     All queries go straight into the retrieval pipeline.
-#   - QueryExpansion REMOVED — it called the LLM just to generate sub-questions.
-#     Expensive and requires internet. Removed entirely.
-#   - Two-mode chain added:
-#       is_online=True  → retrieval + rerank + LLM stream (full RAG)
-#       is_online=False → retrieval only → return OfflineQueryResponse with chunks
-#   - stream() and ask() both accept is_online: bool param
-#   - Chitchat and general fallback prompts REMOVED (no router = no chitchat path)
-#   - RAGChain.stream() yields str tokens then final ChainResponse (online)
-#     or yields OfflineQueryResponse directly (offline, no SSE needed)
+# CHANGES vs previous version:
+#   - OfflineChunk construction in stream() updated to pass 4 new fields:
+#       chunk_type, bbox, page_width, page_height
+#     These come directly from the chunk dict payload (stored at ingestion
+#     time by the updated pdf_loader.py). No logic change — just forwarding
+#     the data that now exists in every chunk dict.
+#
+#   All other logic identical to previous version.
 
 import os
 import sys
@@ -325,6 +321,11 @@ class RAGChain:
             retrieval = self._retrieve(question, is_offline=True)
             chunks    = retrieval.get_chunks()[:offline_top_k]
 
+            # ── CHANGED: pass bbox, page_width, page_height, chunk_type ──
+            # These 4 fields are now stored on every chunk by pdf_loader.py.
+            # We simply forward whatever is in the chunk dict.
+            # chunk.get() with a default handles old chunks that pre-date
+            # this change (e.g. chunks ingested before the upgrade) gracefully.
             offline_chunks = [
                 OfflineChunk(
                     source       = c.get("source", "unknown"),
@@ -333,6 +334,11 @@ class RAGChain:
                     section_path = c.get("section_path", ""),
                     content      = c.get("content", ""),
                     score        = round(float(c.get("score", 0.0)), 4),
+                    # ── NEW ──────────────────────────────────────────────
+                    chunk_type   = c.get("type", "text"),
+                    bbox         = c.get("bbox"),         # list[float] or None
+                    page_width   = c.get("page_width"),   # float or None
+                    page_height  = c.get("page_height"),  # float or None
                 )
                 for c in chunks
             ]
