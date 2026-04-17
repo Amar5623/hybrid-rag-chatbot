@@ -1,3 +1,10 @@
+# config.py
+#
+# CHANGES vs previous version (Day 2 — A5):
+#   - PDFS_DIR added: data/pdfs/ directory where ingested PDF files are
+#     copied and served as static files via /pdfs/{filename}.
+#   - Directory is created on startup alongside existing dirs.
+
 from pydantic_settings import BaseSettings
 from pathlib import Path
 
@@ -79,6 +86,12 @@ HF_TOKEN             = settings.hf_token
 BM25_PATH            = str(Path(settings.qdrant_path).parent / "bm25.pkl")
 IMAGES_DIR           = str(BASE_DIR / "data" / "images")
 
+# ── NEW (A5): PDFs directory ───────────────────────────────────
+# Ingested PDF files are copied here so they can be served as static
+# files at /pdfs/{filename}. This enables the PDF viewer modal (B1).
+PDFS_DIR = str(BASE_DIR / "data" / "pdfs")
+
 # Ensure directories exist
 Path(IMAGES_DIR).mkdir(parents=True, exist_ok=True)
+Path(PDFS_DIR).mkdir(parents=True, exist_ok=True)
 Path(settings.qdrant_path).mkdir(parents=True, exist_ok=True)

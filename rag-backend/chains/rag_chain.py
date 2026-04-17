@@ -1,13 +1,21 @@
 # chains/rag_chain.py
 #
-# CHANGES vs previous version:
-#   - OfflineChunk construction in stream() updated to pass 4 new fields:
-#       chunk_type, bbox, page_width, page_height
-#     These come directly from the chunk dict payload (stored at ingestion
-#     time by the updated pdf_loader.py). No logic change — just forwarding
-#     the data that now exists in every chunk dict.
+# CHANGES vs previous version (Day 2 — A4):
+#   - _retrieve() restructured: rerank children FIRST, expand to parents AFTER.
 #
-#   All other logic identical to previous version.
+#   OLD flow (broken):
+#       retrieve()        → children + expand → parent blobs (1500 tok)
+#       reranker.rerank() → scores parent blobs  ← low precision
+#
+#   NEW flow (A4):
+#       retrieve()                       → raw child chunks (300 tok)
+#       reranker.rerank()                → top-N children  ← precise signal
+#       retriever.expand_to_parents()    → parent blobs (1500 tok) for LLM
+#
+#   OFFLINE mode unchanged: retrieve() returns child chunks, no reranker,
+#   no expansion — workers see the precise matched passage (actually better UX).
+#
+#   All other logic (stream/ask/online fallback/ChainResponse) identical.
 
 import os
 import sys
@@ -127,13 +135,15 @@ class RAGChain:
     Simplified RAG pipeline for offline-capable ship manual lookup.
 
     Online  (is_online=True):
-        Retrieve → Rerank → LLM stream → ChainResponse
+        Retrieve children → Rerank children → Expand to parents → LLM stream
     Offline (is_online=False):
-        Retrieve (no reranker) → OfflineQueryResponse with chunk cards
-        No LLM call, no SSE — just JSON with manual excerpts.
+        Retrieve children (no rerank, no expand) → OfflineQueryResponse with chunk cards
+        No LLM call, no SSE — just JSON with precise manual excerpts.
 
-    QueryRouter removed: all queries are document queries.
-    QueryExpansion removed: no LLM call before retrieval.
+    A4 KEY CHANGE:
+        _retrieve() now separates reranking from parent expansion.
+        Reranker runs on 300-token children (precise), then expansion
+        gives the LLM 1500-token parent passages (context). Both win.
     """
 
     def __init__(
@@ -182,7 +192,7 @@ class RAGChain:
         print(f"\n  [RAG CHAIN] ✅ Ready!")
         print(f"  [RAG CHAIN] LLM       : {self.llm.model_name}")
         print(f"  [RAG CHAIN] Retriever : {type(self.retriever).__name__}")
-        print(f"  [RAG CHAIN] Reranker  : {'✅ (online only)' if use_reranker else '❌'}")
+        print(f"  [RAG CHAIN] Reranker  : {'✅ children first (A4)' if use_reranker else '❌'}")
         print(f"  [RAG CHAIN] Mode      : online/offline branching enabled")
 
     # ── INDEXING ──────────────────────────────────────────
@@ -197,9 +207,22 @@ class RAGChain:
 
     def _retrieve(self, question: str, is_offline: bool = False) -> RetrievalResult:
         """
-        Run retrieval. In offline mode, passes is_offline=True to the retriever
-        so the reranker step inside HybridRetriever is skipped.
-        After retrieval, if we're online, we apply the cross-encoder reranker here.
+        Run retrieval with the correct child-first / parent-expand order.
+
+        OFFLINE mode:
+            retrieve() → child chunks (300 tok) → return directly
+            No reranking (CPU-intensive), no parent expansion.
+            Workers see the precise matched passage — better UX.
+
+        ONLINE mode (A4 fix):
+            retrieve() → child chunks (300 tok)
+            [optional] rerank children → precise cross-encoder signal
+            expand_to_parents()        → 1500-tok passages for LLM context
+
+        The separation of rerank and expand is the core of A4:
+            - Reranker gets small, precise chunks → higher signal per token
+            - LLM gets full parent passages       → coherent, complete context
+            - Both operations get the input they're best at
         """
         retrieval = self.retriever.retrieve(
             question,
@@ -208,13 +231,30 @@ class RAGChain:
             is_offline   = is_offline,
         )
 
-        # Online only: apply reranker
-        if not is_offline and self.use_reranker and self.reranker and len(retrieval) > 0:
+        # ── OFFLINE: return child chunks directly ──────────
+        if is_offline:
+            print(f"  [RAG CHAIN] Offline — returning {len(retrieval)} child chunks (no rerank, no expand)")
+            return retrieval
+
+        # ── ONLINE: rerank children first (A4) ─────────────
+        # Step 1: Rerank against child content (300 tokens — precise match signal)
+        if self.use_reranker and self.reranker and len(retrieval) > 0:
+            print(f"  [RAG CHAIN] Reranking {len(retrieval)} children...")
             retrieval = self.reranker.rerank(
                 query     = question,
                 retrieval = retrieval,
                 top_k     = self.rerank_top_k,
             )
+
+        # Step 2: Expand top-N children to parent passages for LLM context
+        # The retriever has parent_content stored inline on every chunk —
+        # this is a pure in-memory field lookup, no DB round-trip.
+        if hasattr(self.retriever, "expand_to_parents"):
+            retrieval = self.retriever.expand_to_parents(retrieval)
+        else:
+            # Graceful degradation: if retriever doesn't support expansion
+            # (e.g. NaiveRetriever), just use whatever chunks we have.
+            print("  [RAG CHAIN] expand_to_parents not available on this retriever — skipping")
 
         return retrieval
 
@@ -318,14 +358,10 @@ class RAGChain:
                 return
 
             offline_top_k = settings.offline_top_k
+            # _retrieve with is_offline=True returns child chunks directly
             retrieval = self._retrieve(question, is_offline=True)
             chunks    = retrieval.get_chunks()[:offline_top_k]
 
-            # ── CHANGED: pass bbox, page_width, page_height, chunk_type ──
-            # These 4 fields are now stored on every chunk by pdf_loader.py.
-            # We simply forward whatever is in the chunk dict.
-            # chunk.get() with a default handles old chunks that pre-date
-            # this change (e.g. chunks ingested before the upgrade) gracefully.
             offline_chunks = [
                 OfflineChunk(
                     source       = c.get("source", "unknown"),
@@ -334,11 +370,10 @@ class RAGChain:
                     section_path = c.get("section_path", ""),
                     content      = c.get("content", ""),
                     score        = round(float(c.get("score", 0.0)), 4),
-                    # ── NEW ──────────────────────────────────────────────
                     chunk_type   = c.get("type", "text"),
-                    bbox         = c.get("bbox"),         # list[float] or None
-                    page_width   = c.get("page_width"),   # float or None
-                    page_height  = c.get("page_height"),  # float or None
+                    bbox         = c.get("bbox"),
+                    page_width   = c.get("page_width"),
+                    page_height  = c.get("page_height"),
                 )
                 for c in chunks
             ]
@@ -379,7 +414,7 @@ class RAGChain:
             )
             return
 
-        # Retrieve + rerank (online)
+        # Retrieve + rerank children + expand to parents (online — A4)
         retrieval = self._retrieve(question, is_offline=False)
         context   = retrieval.to_context_string()
 
