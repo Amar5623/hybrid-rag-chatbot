@@ -1,13 +1,40 @@
 # ingestion/pdf_loader.py
 #
-# CHANGES vs original:
-#   - Tesseract OCR removed entirely (was too heavy, fragile on low-end machines)
-#   - Images now use page context as semantic description — same search quality
-#   - Heading detection upgraded: full section_path breadcrumb
-#     e.g. "Chapter 3 > 3.1 Methods > Results" instead of just last heading
-#   - Bullet / numbered list detection — avoids merging list items into blob text
-#   - pdfplumber still used for tables only (it's genuinely better for this)
-#   - _make_chunk signature unchanged — all other loaders inherit BaseLoader unmodified
+# CHANGES vs previous version:
+#   - bbox [x0, y0, x1, y1] now captured and stored on every text chunk.
+#   - page_width and page_height stored on every text chunk.
+#   - Table chunks get bbox from pdfplumber's find_tables() (replaces extract_tables()).
+#   - Image chunks get bbox from PyMuPDF get_image_rects() — falls back to None.
+#   - _make_chunk() docstring updated to document new fields.
+#
+#   WHY bbox MATTERS:
+#     At ingestion time, PyMuPDF gives us the exact (x0, y0, x1, y1) rectangle
+#     of every text block on the page — in PDF point coordinates (1pt = 1/72 inch).
+#     If we don't store this NOW, we can never recover it without re-parsing the PDF.
+#     The frontend PDF viewer (Person B, Day 2) will use these coordinates to draw
+#     a highlight rectangle over the exact source text when a worker clicks
+#     "Open in manual". This is the entire foundation of the PDF deep-link feature.
+#
+#   COORDINATE SYSTEM:
+#     PDF coordinate origin is top-left (0, 0).
+#     x0 = left edge of block
+#     y0 = top edge of block
+#     x1 = right edge of block
+#     y1 = bottom edge of block
+#     page_width / page_height: dimensions of the page in the same units.
+#     The frontend uses (bbox / page_dimensions) to position highlights at any zoom.
+#
+#   TABLE CHANGE:
+#     extract_tables() → find_tables() + table.extract()
+#     find_tables() returns Table objects which have a .bbox property.
+#     extract_tables() returns only the raw cell data with no position info.
+#     Functionally identical for the text content, now also yields position.
+#
+#   BACKWARD COMPATIBILITY:
+#     bbox, page_width, page_height default to None in _make_chunk() via chunk.update(extra).
+#     Chunks that don't pass these (image chunks where bbox can't be recovered) simply
+#     have None — the frontend handles this gracefully by navigating to the page
+#     without a highlight overlay.
 
 import os
 import re
@@ -62,15 +89,39 @@ class BaseLoader:
         """
         Standard chunk format used across all loaders.
         Extra keyword args are merged directly — lets subclasses inject
-        heading, section_path, image_path, row_range, sheet_name, etc.
+        heading, section_path, image_path, bbox, page_width, page_height, etc.
+
+        Standard fields always present:
+            content      : str   — the text content of this chunk
+            page         : int   — 1-indexed page number
+            type         : str   — "text" | "heading" | "bullet" | "table" | "image"
+            source       : str   — filename of the source document
+            heading      : str   — last heading seen before this block (may be "")
+            section_path : str   — full breadcrumb e.g. "Ch3 > 3.1 > Results"
+
+        Optional fields (set by PDFLoader, None if unavailable):
+            bbox         : list[float] | None — [x0, y0, x1, y1] in PDF points
+            page_width   : float | None       — page width in PDF points
+            page_height  : float | None       — page height in PDF points
+
+            These three are the foundation of the PDF deep-link highlight feature.
+            Frontend uses:  highlight_x = bbox[0] / page_width * canvas_width
+                            highlight_y = bbox[1] / page_height * canvas_height
+
+        Other optional fields injected by specific loaders:
+            image_path   : str  — absolute path to extracted image file
         """
         chunk = {
             "content"     : content,
             "page"        : page,
             "type"        : chunk_type,
             "source"      : self.file_name,
-            "heading"     : "",          # overridden by PDF loader
-            "section_path": "",          # NEW: full breadcrumb
+            "heading"     : "",
+            "section_path": "",
+            # NEW: bbox fields — default None, overridden by PDFLoader
+            "bbox"        : None,
+            "page_width"  : None,
+            "page_height" : None,
         }
         chunk.update(extra)
         return chunk
@@ -89,10 +140,9 @@ class BaseLoader:
 class PDFLoader(BaseLoader):
     """
     Loads PDF files and extracts:
-      - Text   (via PyMuPDF) with full section breadcrumb + bullet detection
-      - Tables (via pdfplumber) — converted to markdown
-      - Images (via PyMuPDF)   — page context used as semantic description
-                                  No Tesseract OCR required
+      - Text   (via PyMuPDF) with full section breadcrumb + bullet detection + BBOX
+      - Tables (via pdfplumber find_tables) — converted to markdown + BBOX
+      - Images (via PyMuPDF)   — page context used as semantic description + BBOX attempt
 
     SECTION BREADCRUMB (section_path):
     ───────────────────────────────────
@@ -112,6 +162,13 @@ class PDFLoader(BaseLoader):
     ──────────────────
     Lines matching _BULLET_RE are tagged type="bullet" instead of "text".
     This prevents bullet lists from being merged into prose blobs.
+
+    BBOX STORAGE (NEW):
+    ────────────────────
+    Every text block's PyMuPDF bbox → stored as [x0, y0, x1, y1].
+    page_width and page_height stored alongside so the frontend can
+    compute normalized positions at any zoom level.
+    Coordinate system: origin at top-left, units in PDF points (1pt = 1/72 inch).
 
     IMAGE SEMANTICS WITHOUT OCR:
     ──────────────────────────────
@@ -149,15 +206,24 @@ class PDFLoader(BaseLoader):
         print(f"  ✅ {self.get_summary()}")
         return self.chunks
 
-    # ── TEXT + HEADINGS + BULLETS ─────────────────────────
+    # ── TEXT + HEADINGS + BULLETS + BBOX ─────────────────
 
     def _extract_text_with_structure(self) -> list[dict]:
         """
-        Extract text with full section breadcrumb and bullet detection.
+        Extract text blocks with:
+          - Full section breadcrumb (section_stack)
+          - Heading level detection (font-size ratio)
+          - Bullet/list detection (_BULLET_RE)
+          - BBOX [x0, y0, x1, y1] for each block  ← NEW
+          - page_width, page_height for each block ← NEW
 
-        Section stack: [(level, heading_text), ...]
-        When a new heading is found, all stack entries at the same or deeper
-        level are popped, then the new heading is pushed.
+        The bbox is taken directly from blk["bbox"] in PyMuPDF's block dict.
+        It's a fitz.Rect-compatible tuple (x0, y0, x1, y1) in PDF points.
+        We round to 2 decimal places to keep payload size reasonable.
+
+        page_width / page_height come from page.rect.width / .height.
+        These are stored once per block (they're constant per page) so the
+        frontend always has what it needs without a separate page-info lookup.
         """
         results: list[dict] = []
         doc = fitz.open(self.file_path)
@@ -168,6 +234,13 @@ class PDFLoader(BaseLoader):
         for page_num, page in enumerate(doc):
             page_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
             blocks    = page_dict.get("blocks", [])
+
+            # ── NEW: page dimensions ──────────────────────
+            # Stored on every chunk from this page.
+            # page.rect is a fitz.Rect(x0, y0, x1, y1) — for a standard page,
+            # x0=0, y0=0, so width = rect.x1, height = rect.y1.
+            pg_width  = round(page.rect.width,  2)
+            pg_height = round(page.rect.height, 2)
 
             # Collect all non-empty font sizes to compute median (body) size
             all_sizes: list[float] = []
@@ -188,13 +261,13 @@ class PDFLoader(BaseLoader):
                 if blk.get("type") != 0:   # 0 = text block
                     continue
 
-                block_lines: list[str] = []
-                max_span_size: float   = 0.0
-                has_bullet             = False
+                block_lines  : list[str] = []
+                max_span_size: float     = 0.0
+                has_bullet               = False
 
                 for line in blk.get("lines", []):
-                    line_text  = ""
-                    line_max   = 0.0
+                    line_text = ""
+                    line_max  = 0.0
 
                     for span in line.get("spans", []):
                         t = span.get("text", "")
@@ -218,12 +291,20 @@ class PDFLoader(BaseLoader):
                 if not content:
                     continue
 
+                # ── NEW: extract block bbox ───────────────
+                # blk["bbox"] is (x0, y0, x1, y1) in PDF points.
+                # Round to 2 dp — full float precision is unnecessary overhead.
+                raw_bbox  = blk.get("bbox")
+                block_bbox = (
+                    [round(v, 2) for v in raw_bbox]
+                    if raw_bbox and len(raw_bbox) == 4
+                    else None
+                )
+
                 # ── Classify block ──────────────────────────
                 if max_span_size >= heading_threshold and len(content) < 200:
-                    # Heading — update the section stack
                     block_type = "heading"
                     level      = self._heading_level(max_span_size, body_size)
-                    # Pop stack entries at same or deeper level
                     section_stack = [
                         (lvl, txt)
                         for lvl, txt in section_stack
@@ -245,17 +326,34 @@ class PDFLoader(BaseLoader):
                         chunk_type   = block_type,
                         heading      = heading,
                         section_path = section_path,
+                        # ── NEW ──────────────────────────
+                        bbox         = block_bbox,
+                        page_width   = pg_width,
+                        page_height  = pg_height,
                     )
                 )
 
         doc.close()
-        print(f"  [TEXT]  {len(results)} text/heading/bullet blocks")
+        print(f"  [TEXT]  {len(results)} text/heading/bullet blocks (bbox captured)")
         return results
 
-    # ── TABLES ────────────────────────────────────────────
+    # ── TABLES + BBOX ─────────────────────────────────────
 
     def _extract_tables(self) -> list[dict]:
-        """Extract tables using pdfplumber → convert to markdown."""
+        """
+        Extract tables using pdfplumber.
+
+        CHANGED: extract_tables() → find_tables() + table.extract()
+        find_tables() returns Table objects which expose .bbox.
+        extract_tables() only returns raw cell data — no position info.
+
+        Table.bbox is (x0, top, x1, bottom) in pdfplumber's coordinate system
+        (same as PDF points, origin top-left) — directly compatible with our
+        chunk bbox format [x0, y0, x1, y1].
+
+        If pdfplumber is not installed or find_tables() fails, falls back
+        gracefully (bbox = None, content extraction still attempted).
+        """
         results: list[dict] = []
 
         if not _HAS_PDFPLUMBER:
@@ -265,46 +363,86 @@ class PDFLoader(BaseLoader):
         try:
             with pdfplumber.open(self.file_path) as pdf:
                 for page_num, page in enumerate(pdf.pages):
-                    for t_idx, table in enumerate(page.extract_tables()):
-                        md = self._table_to_markdown(table)
-                        if md:
-                            content = f"[TABLE {t_idx+1} — Page {page_num+1}]\n{md}"
-                            results.append(
-                                self._make_chunk(
-                                    content    = content,
-                                    page       = page_num + 1,
-                                    chunk_type = "table",
-                                )
+
+                    # CHANGED: find_tables() gives us Table objects with .bbox
+                    # table.extract() gives the same cell data as extract_tables()
+                    try:
+                        tables = page.find_tables()
+                    except Exception:
+                        tables = []
+
+                    for t_idx, table in enumerate(tables):
+                        try:
+                            raw_data = table.extract()
+                        except Exception:
+                            continue
+
+                        md = self._table_to_markdown(raw_data)
+                        if not md:
+                            continue
+
+                        content = f"[TABLE {t_idx+1} — Page {page_num+1}]\n{md}"
+
+                        # ── NEW: table bbox ───────────────────────────
+                        # table.bbox → (x0, top, x1, bottom) in PDF points
+                        # Directly maps to our [x0, y0, x1, y1] format.
+                        table_bbox = None
+                        if hasattr(table, "bbox") and table.bbox:
+                            try:
+                                table_bbox = [round(v, 2) for v in table.bbox]
+                            except (TypeError, ValueError):
+                                table_bbox = None
+
+                        # page dimensions from pdfplumber
+                        pg_width  = round(float(page.width),  2) if page.width  else None
+                        pg_height = round(float(page.height), 2) if page.height else None
+
+                        results.append(
+                            self._make_chunk(
+                                content     = content,
+                                page        = page_num + 1,
+                                chunk_type  = "table",
+                                bbox        = table_bbox,   # NEW
+                                page_width  = pg_width,     # NEW
+                                page_height = pg_height,    # NEW
                             )
+                        )
+
         except Exception as e:
             print(f"  [TABLES] Extraction error: {e}")
 
-        print(f"  [TABLES] {len(results)} tables extracted")
+        print(f"  [TABLES] {len(results)} tables extracted (bbox captured where available)")
         return results
 
-    # ── IMAGES ────────────────────────────────────────────
+    # ── IMAGES + BBOX ─────────────────────────────────────
 
     def _extract_images(self) -> list[dict]:
         """
         Extract images and create searchable chunks — NO Tesseract.
 
-        Content priority:
-          1. Page context (surrounding text as semantic description)
-          2. Generic label (absolute fallback)
+        CHANGED: now attempts to recover the on-page bbox for each image
+        via page.get_image_rects(xref). This returns the list of rectangles
+        where the image is drawn on the page. We take the first (largest) one.
 
-        Why no OCR?
-          Tesseract is ~400MB, needs system install, is slow on low-end hardware,
-          and returns empty text for diagrams/figures anyway. Page context gives
-          equal or better semantic retrieval for most use cases.
+        If get_image_rects() fails or returns nothing, bbox stays None.
+        The frontend handles None bbox by navigating to the page without
+        drawing a highlight — still useful (worker goes to right page).
+
+        Content priority (unchanged):
+          1. Page context  (first 300 chars of surrounding page text)
+          2. Generic label (absolute fallback)
         """
         os.makedirs(self.image_output_dir, exist_ok=True)
         results: list[dict] = []
         doc     = fitz.open(self.file_path)
 
         for page_num, page in enumerate(doc):
-            # Page text used as semantic description for figures on this page
             page_text    = page.get_text("text").strip()
             page_context = page_text[:300].replace("\n", " ").strip()
+
+            # Page dimensions — same as text extractor
+            pg_width  = round(page.rect.width,  2)
+            pg_height = round(page.rect.height, 2)
 
             for img_idx, img_info in enumerate(page.get_images(full=True)):
                 xref = img_info[0]
@@ -324,6 +462,22 @@ class PDFLoader(BaseLoader):
                     with open(img_path, "wb") as f:
                         f.write(img_bytes)
 
+                    # ── NEW: image bbox ───────────────────────────────
+                    # get_image_rects(xref) returns list of fitz.Rect where
+                    # this image xref is placed on the page.
+                    # We take the first one (images rarely appear multiple times).
+                    # Falls back to None if unavailable (older PyMuPDF versions
+                    # or embedded images with complex placement transforms).
+                    img_bbox = None
+                    try:
+                        rects = page.get_image_rects(xref)
+                        if rects:
+                            r        = rects[0]
+                            img_bbox = [round(r.x0, 2), round(r.y0, 2),
+                                        round(r.x1, 2), round(r.y1, 2)]
+                    except Exception:
+                        img_bbox = None
+
                     if page_context:
                         content = (
                             f"[IMAGE — Page {page_num+1}, Figure {img_idx+1}] "
@@ -337,10 +491,13 @@ class PDFLoader(BaseLoader):
 
                     results.append(
                         self._make_chunk(
-                            content    = content,
-                            page       = page_num + 1,
-                            chunk_type = "image",
-                            image_path = img_path,
+                            content     = content,
+                            page        = page_num + 1,
+                            chunk_type  = "image",
+                            image_path  = img_path,
+                            bbox        = img_bbox,     # NEW
+                            page_width  = pg_width,     # NEW
+                            page_height = pg_height,    # NEW
                         )
                     )
 
@@ -348,7 +505,7 @@ class PDFLoader(BaseLoader):
                     print(f"  [IMAGE]  Skipped p{page_num+1} i{img_idx+1}: {e}")
 
         doc.close()
-        print(f"  [IMAGES] {len(results)} images extracted (no OCR)")
+        print(f"  [IMAGES] {len(results)} images extracted (bbox attempted for all)")
         return results
 
     # ── HELPERS ───────────────────────────────────────────
