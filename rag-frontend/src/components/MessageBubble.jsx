@@ -5,17 +5,9 @@
 //     showing source filename, page number, section heading, and raw chunk text.
 //   - When message.is_offline is true, renders OfflineChunkCards instead of markdown.
 //   - Online path unchanged.
-//
-// NEW (B3/B4/B5/B1/B2):
-//   - B3: Restructured chunk card layout — breadcrumb section path, relevance bar
-//   - B4: Query keyword highlighting in chunk content
-//   - B5: Expand/collapse chunk content (3 lines default, "Show more" toggle)
-//   - B1/B2: Clickable "Open in manual" button opens PdfViewerModal (uses bbox when available)
 
-import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm    from 'remark-gfm'
-import PdfViewerModal from './PdfViewerModal'
 
 const IMAGE_BASE = ''
 
@@ -111,179 +103,62 @@ function TypingDots() {
   )
 }
 
-// ── B4: Highlight query keywords in text ──────────────────────
-const STOPWORDS = new Set(['a','an','the','is','are','was','were','be','been','being',
-  'have','has','had','do','does','did','will','would','could','should','may','might',
-  'shall','can','need','dare','used','ought','in','on','at','to','for','of','and',
-  'or','but','not','with','this','that','it','its','as','by','from','what','how'])
-
-function highlightKeywords(text, query) {
-  if (!query) return text
-  const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 2 && !STOPWORDS.has(w))
-  if (!words.length) return text
-
-  const pattern = new RegExp(`(${words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
-  const parts = text.split(pattern)
-
-  return parts.map((part, i) =>
-    pattern.test(part)
-      ? <mark key={i} style={{ background: 'rgba(251,191,36,0.25)', color: 'var(--text-0)', borderRadius: 2, padding: '0 1px' }}>{part}</mark>
-      : part
-  )
-}
-
-// ── B3: Section breadcrumb ──────────────────────────────────────
-function SectionBreadcrumb({ section }) {
-  if (!section) return null
-  const parts = section.split(/\s*[>\/]\s*/)
-  return (
-    <div style={{
-      fontFamily: 'var(--font-mono)', fontSize: '.62rem',
-      color: 'var(--text-2)', marginTop: 4,
-      display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 3,
-    }}>
-      {parts.map((p, i) => (
-        <span key={i} style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-          {i > 0 && <span style={{ color: 'var(--text-3)' }}>›</span>}
-          <span style={{ color: i === parts.length - 1 ? 'var(--accent-text)' : 'var(--text-2)' }}>{p}</span>
-        </span>
-      ))}
-    </div>
-  )
-}
-
-// ── B3: Relevance bar ───────────────────────────────────────────
-function RelevanceBar({ score }) {
-  // score is typically 0–1 from RRF; clamp to 0–1
-  const pct = Math.min(1, Math.max(0, score)) * 100
-  const color = pct > 65 ? '#34d399' : pct > 35 ? '#fbbf24' : '#94a3b8'
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 8 }}>
-      <div style={{
-        flex: 1, height: 3, background: 'var(--bg-4)',
-        borderRadius: 2, overflow: 'hidden',
-      }}>
-        <div style={{ width: `${pct}%`, height: '100%', background: color, borderRadius: 2, transition: 'width .3s' }} />
-      </div>
-      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.6rem', color: 'var(--text-3)', flexShrink: 0 }}>
-        {score.toFixed(2)}
-      </span>
-    </div>
-  )
-}
-
-// ── Offline chunk card (B2 + B3 + B4 + B5) ────────────────────
-function OfflineChunkCard({ chunk, index, query, onOpenPdf }) {
-  const [expanded, setExpanded] = useState(false)
-  const section  = chunk.section_path || chunk.heading || ''
-  const lines    = chunk.content.split('\n')
-  const isLong   = lines.length > 3 || chunk.content.length > 300
-  const displayed = (!isLong || expanded) ? chunk.content : lines.slice(0, 3).join('\n')
-  const hasPdf   = !!chunk.source
-
+// ── Offline chunk card ─────────────────────────────────────────
+function OfflineChunkCard({ chunk, index }) {
+  const section = chunk.section_path || chunk.heading || ''
   return (
     <div style={{
       background: 'var(--bg-3)',
       border: '1px solid var(--border-md)',
       borderRadius: 'var(--r-md)',
+      padding: '12px 14px',
       marginBottom: 8,
-      overflow: 'hidden',
-      transition: 'border-color .15s',
-    }}
-      onMouseEnter={e => e.currentTarget.style.borderColor = 'rgba(124,106,247,.35)'}
-      onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border-md)'}
-    >
-      {/* ── Header row ── */}
-      <div style={{ padding: '10px 14px 0' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{
-            fontFamily: 'var(--font-mono)', fontSize: '.6rem',
-            color: 'var(--text-3)', background: 'var(--bg-4)',
-            padding: '2px 6px', borderRadius: 8, flexShrink: 0,
-          }}>#{index + 1}</span>
+    }}>
+      {/* Header row */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        marginBottom: 8, flexWrap: 'wrap',
+      }}>
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: '.62rem',
+          color: 'var(--text-3)', background: 'var(--bg-4)',
+          padding: '2px 7px', borderRadius: 10, flexShrink: 0,
+        }}>#{index + 1}</span>
 
-          {/* B2: Clickable source+page → opens PDF viewer */}
-          <button
-            onClick={() => hasPdf && onOpenPdf(chunk)}
-            disabled={!hasPdf}
-            title={hasPdf ? 'Open in manual' : ''}
-            style={{
-              background: 'none', border: 'none', padding: 0,
-              fontFamily: 'var(--font-mono)', fontSize: '.68rem',
-              color: hasPdf ? 'var(--teal)' : 'var(--text-3)',
-              cursor: hasPdf ? 'pointer' : 'default',
-              flex: 1, textAlign: 'left',
-              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              textDecoration: hasPdf ? 'underline' : 'none',
-              textDecorationColor: 'rgba(45,212,191,.3)',
-              textUnderlineOffset: 3,
-            }}
-          >
-            📄 {chunk.source}{chunk.page ? ` · Page ${chunk.page}` : ''}
-          </button>
-
-          {hasPdf && (
-            <button
-              onClick={() => onOpenPdf(chunk)}
-              style={{
-                background: 'var(--bg-4)', border: '1px solid var(--border-md)',
-                color: 'var(--teal)', borderRadius: 6,
-                padding: '2px 8px', fontSize: '.6rem', cursor: 'pointer',
-                fontFamily: 'var(--font-mono)', flexShrink: 0,
-                display: 'flex', alignItems: 'center', gap: 4,
-              }}
-              title="Open in PDF viewer"
-            >
-              📖 Open
-            </button>
-          )}
-        </div>
-
-        {/* B3: Section breadcrumb on its own row */}
-        <SectionBreadcrumb section={section} />
-      </div>
-
-      {/* ── Chunk content (B4 highlight + B5 expand) ── */}
-      <div style={{ padding: '10px 14px 0' }}>
-        <div style={{
-          fontSize: '.83rem', color: 'var(--text-1)',
-          lineHeight: 1.65, whiteSpace: 'pre-wrap',
-          fontFamily: 'var(--font-body)',
+        <span style={{
+          fontFamily: 'var(--font-mono)', fontSize: '.68rem',
+          color: 'var(--teal)', flex: 1,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}>
-          {highlightKeywords(displayed, query)}
-          {isLong && !expanded && (
-            <span style={{ color: 'var(--text-3)', fontStyle: 'italic' }}>…</span>
-          )}
-        </div>
+          📄 {chunk.source}{chunk.page ? ` · p${chunk.page}` : ''}
+        </span>
 
-        {/* B5: Show more/less toggle */}
-        {isLong && (
-          <button
-            onClick={() => setExpanded(e => !e)}
-            style={{
-              background: 'none', border: 'none', padding: '6px 0 0',
-              color: 'var(--accent-text)', fontSize: '.72rem',
-              fontFamily: 'var(--font-mono)', cursor: 'pointer',
-              display: 'block',
-            }}
-          >
-            {expanded ? '▲ Show less' : '▼ Show more'}
-          </button>
+        {section && (
+          <span style={{
+            fontFamily: 'var(--font-mono)', fontSize: '.62rem',
+            color: 'var(--accent-text)',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            maxWidth: 240,
+          }} title={section}>
+            {section}
+          </span>
         )}
       </div>
 
-      {/* B3: Relevance bar */}
-      <div style={{ padding: '4px 14px 10px' }}>
-        <RelevanceBar score={chunk.score} />
+      {/* Chunk content */}
+      <div style={{
+        fontSize: '.83rem', color: 'var(--text-1)',
+        lineHeight: 1.65, whiteSpace: 'pre-wrap',
+        fontFamily: 'var(--font-body)',
+      }}>
+        {chunk.content}
       </div>
     </div>
   )
 }
 
 // Renders all offline chunks with a header
-function OfflineChunkCards({ chunks, query }) {
-  const [pdfModal, setPdfModal] = useState(null) // { filename, page, bbox, sectionPath }
-
+function OfflineChunkCards({ chunks }) {
   if (!chunks?.length) {
     return (
       <div style={{ fontSize: '.85rem', color: 'var(--text-2)', padding: '8px 0' }}>
@@ -291,16 +166,6 @@ function OfflineChunkCards({ chunks, query }) {
       </div>
     )
   }
-
-  const handleOpenPdf = (chunk) => {
-    setPdfModal({
-      filename   : chunk.source,
-      page       : chunk.page || 1,
-      bbox       : chunk.bbox || null,
-      sectionPath: chunk.section_path || chunk.heading || '',
-    })
-  }
-
   return (
     <div>
       <div style={{
@@ -311,25 +176,8 @@ function OfflineChunkCards({ chunks, query }) {
         {chunks.length} relevant section{chunks.length > 1 ? 's' : ''} found
       </div>
       {chunks.map((chunk, i) => (
-        <OfflineChunkCard
-          key={i}
-          chunk={chunk}
-          index={i}
-          query={query}
-          onOpenPdf={handleOpenPdf}
-        />
+        <OfflineChunkCard key={i} chunk={chunk} index={i} />
       ))}
-
-      {/* B1: PDF viewer modal */}
-      {pdfModal && (
-        <PdfViewerModal
-          filename={pdfModal.filename}
-          page={pdfModal.page}
-          bbox={pdfModal.bbox}
-          sectionPath={pdfModal.sectionPath}
-          onClose={() => setPdfModal(null)}
-        />
-      )}
     </div>
   )
 }
@@ -337,7 +185,7 @@ function OfflineChunkCards({ chunks, query }) {
 
 // ── Main export ───────────────────────────────────────────────
 
-export default function MessageBubble({ message, query }) {
+export default function MessageBubble({ message }) {
   const isUser = message.role === 'user'
 
   if (isUser) {
@@ -416,7 +264,7 @@ export default function MessageBubble({ message, query }) {
 
         {/* ── OFFLINE: chunk cards ─────────────────────── */}
         {message.is_offline && (
-          <OfflineChunkCards chunks={message.offline_chunks} query={query} />
+          <OfflineChunkCards chunks={message.offline_chunks} />
         )}
 
         {/* ── ONLINE: markdown LLM answer ─────────────── */}

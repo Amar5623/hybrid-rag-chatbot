@@ -40,11 +40,6 @@ images_dir = Path(__file__).parent / "data" / "images"
 images_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(images_dir)), name="images")
 
-# Serve original PDFs — this is the important line
-pdfs_dir = Path(__file__).parent / "data" / "pdfs"
-pdfs_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/pdfs", StaticFiles(directory=str(pdfs_dir)), name="pdfs")
-
 app.include_router(chat.router)
 app.include_router(ingest.router)
 app.include_router(kb.router)
