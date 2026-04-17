@@ -1,4 +1,12 @@
 # main.py
+#
+# CHANGES vs previous version (Day 2 — A5):
+#   - /pdfs static mount added — serves PDF files from data/pdfs/.
+#     PDFs are copied there at ingest time (see routers/ingest.py).
+#     Frontend PDF viewer (Person B, Task B1) fetches from /pdfs/{filename}.
+#
+# Everything else unchanged.
+
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -35,15 +43,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve extracted images as static files
+# ── Static files ──────────────────────────────────────────────
+
+# Serve extracted images at /images/{filename}
 images_dir = Path(__file__).parent / "data" / "images"
 images_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(images_dir)), name="images")
 
-# Serve original PDFs — this is the important line
+# ── NEW (A5): Serve original PDF files at /pdfs/{filename} ────
+# When a PDF is ingested, routers/ingest.py copies it to this directory.
+# The frontend PDF viewer (Person B, Task B1) fetches:
+#     GET /pdfs/engine_manual.pdf
+# and renders the page with PDF.js, drawing a highlight bbox over the matched text.
 pdfs_dir = Path(__file__).parent / "data" / "pdfs"
 pdfs_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/pdfs", StaticFiles(directory=str(pdfs_dir)), name="pdfs")
+
+# ── Routers ───────────────────────────────────────────────────
 
 app.include_router(chat.router)
 app.include_router(ingest.router)
