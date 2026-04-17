@@ -1,10 +1,8 @@
 // src/components/ChatWindow.jsx
 //
-// CHANGES vs original:
-//   - currentUser / onLogout props REMOVED — no auth.
-//   - isOnline prop added — shows offline banner in top bar.
-//   - Offline mode: input placeholder changes, send button still works
-//     (useChat handles routing to offline endpoint).
+// CHANGES vs previous version:
+//   - MessageBubble now receives `query` prop (the last user question)
+//     so B4 keyword highlighting works correctly.
 //   - Everything else unchanged.
 
 import { useEffect, useRef, useState } from 'react'
@@ -94,6 +92,9 @@ export default function ChatWindow({
   const isEmpty = messages.length === 0
 
   const inputDisabled = streaming || uploading || !kbReady
+
+  // Derive the last user query so MessageBubble can highlight keywords (B4)
+  const lastUserQuery = [...messages].reverse().find(m => m.role === 'user')?.content || ''
 
   return (
     <div style={{
@@ -218,7 +219,17 @@ export default function ChatWindow({
           </div>
         )}
 
-        {messages.map(msg => <MessageBubble key={msg.id} message={msg} />)}
+        {/* Pass lastUserQuery so each assistant bubble can highlight keywords (B4) */}
+        {messages.map((msg, idx) => {
+          // For each assistant message, find the most recent preceding user message
+          let q = ''
+          if (msg.role === 'assistant') {
+            for (let i = idx - 1; i >= 0; i--) {
+              if (messages[i].role === 'user') { q = messages[i].content; break }
+            }
+          }
+          return <MessageBubble key={msg.id} message={msg} query={q} />
+        })}
         <div ref={bottomRef} />
       </div>
 
