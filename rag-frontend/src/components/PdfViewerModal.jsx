@@ -2,15 +2,15 @@
 import { useEffect, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url
-).toString();
+// Use the legacy build (more reliable with Vite) + correct worker
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 export default function PdfViewerModal({
   filename,
   page: initialPage = 1,
-  bbox = null,
+  bbox = null,           // [x0, y0, x1, y1]
   sectionPath = '',
   onClose,
 }) {
@@ -26,46 +26,17 @@ export default function PdfViewerModal({
     const loadPdf = async () => {
       try {
         setLoading(true);
-        setError(null);
-
-        console.log(`[PDF Viewer] Fetching /pdfs/${filename}`);
-
-        const res = await fetch(`/pdfs/${filename}`, { 
-          method: 'GET',
-          cache: 'no-store'   // force fresh fetch
-        });
-
-        console.log(`[PDF Viewer] Response status: ${res.status} ${res.statusText}`);
-        console.log(`[PDF Viewer] Content-Type: ${res.headers.get('content-type')}`);
-
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status} - Backend did not serve the PDF`);
-        }
-
-        const arrayBuffer = await res.arrayBuffer();
-
-        // Critical check: Is this actually a PDF?
-        const firstBytes = new Uint8Array(arrayBuffer.slice(0, 5));
-        const header = String.fromCharCode(...firstBytes);
-        console.log(`[PDF Viewer] First 5 bytes: ${header}`);
-
-        if (!header.startsWith('%PDF')) {
-          throw new Error('Received invalid PDF data (wrong header)');
-        }
-
-        const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+        const loadingTask = pdfjsLib.getDocument(`/pdfs/${filename}`);
         const pdf = await loadingTask.promise;
-
         setPdfDoc(pdf);
         setLoading(false);
         renderPage(pdf, currentPage);
       } catch (err) {
-        console.error('[PDF Viewer] Load failed:', err);
-        setError(err.message || 'Failed to load PDF. Check backend /pdfs route.');
+        console.error(err);
+        setError(`Could not load PDF: ${filename}. Make sure the backend serves PDFs at /pdfs/`);
         setLoading(false);
       }
     };
-
     loadPdf();
   }, [filename]);
 
@@ -81,6 +52,7 @@ export default function PdfViewerModal({
 
     await page.render({ canvasContext: ctx, viewport }).promise;
 
+    // Draw highlight rectangle if bbox exists
     if (bbox && overlayRef.current) {
       const overlay = overlayRef.current;
       overlay.width = viewport.width;
@@ -93,7 +65,12 @@ export default function PdfViewerModal({
       const height = y1 - y0;
 
       oCtx.fillStyle = 'rgba(251, 191, 36, 0.35)';
-      oCtx.fillRect(x0 * scale, viewport.height - y1 * scale, width * scale, height * scale);
+      oCtx.fillRect(
+        x0 * scale,
+        (viewport.height - y1 * scale),
+        width * scale,
+        height * scale
+      );
     }
   };
 
@@ -115,6 +92,7 @@ export default function PdfViewerModal({
         width: '95%', maxWidth: 1100, maxHeight: '95vh',
         display: 'flex', flexDirection: 'column', overflow: 'hidden',
       }}>
+        {/* Header */}
         <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.9rem', color: 'var(--teal)' }}>📖 {filename}</div>
@@ -133,9 +111,10 @@ export default function PdfViewerModal({
           </div>
         </div>
 
+        {/* PDF Area */}
         <div style={{ position: 'relative', flex: 1, overflow: 'auto', background: '#1a1a1a', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           {loading && <div style={{ color: 'var(--text-2)' }}>Loading PDF…</div>}
-          {error && <div style={{ color: '#f59e0b', padding: '20px', textAlign: 'center' }}>{error}</div>}
+          {error && <div style={{ color: '#f59e0b' }}>{error}</div>}
 
           {!loading && !error && (
             <>
@@ -145,9 +124,10 @@ export default function PdfViewerModal({
           )}
         </div>
 
+        {/* Zoom controls */}
         <div style={{ padding: '10px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 12, justifyContent: 'center' }}>
           <button onClick={() => setScale(s => Math.max(0.8, s - 0.3))} style={zoomBtn}>− Zoom</button>
-          <button onClick={() => setScale(1.5)} style={zoomBtn}>Reset</button>
+          <button onClick={() => setScale(1.5)} style={zoomBtn}>Reset Zoom</button>
           <button onClick={() => setScale(s => s + 0.3)} style={zoomBtn}>+ Zoom</button>
         </div>
       </div>
