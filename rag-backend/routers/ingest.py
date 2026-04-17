@@ -1,10 +1,17 @@
 # routers/ingest.py
 #
-# CHANGES vs original:
-#   - JWT auth dependency REMOVED from all routes.
-#   - POST /ingest/sync added — triggers the sync service to check the
-#     manifest and pull new docs. Called automatically when internet detected.
-#   - Everything else unchanged.
+# CHANGES vs previous version (Day 2 — A5):
+#   - _ingest_files_sync(): after hashing + loading, the PDF is now copied to
+#     data/pdfs/{filename} for static serving. This enables the PDF viewer
+#     modal (Person B, Task B1) to fetch and render the original document.
+#
+#   - _delete_pdf_file(): new helper that removes data/pdfs/{filename}
+#     when a file is deleted from the knowledge base.
+#
+#   - delete_file endpoint: now also calls _delete_pdf_file() so the
+#     stored PDF is cleaned up alongside vectors and BM25 entries.
+#
+#   Everything else unchanged (duplicate check, chunking, indexing).
 
 import hashlib
 import json
@@ -16,7 +23,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 
-from config import settings
+from config import settings, PDFS_DIR
 from services import rag_service as _svc
 from ingestion.pdf_loader  import PDFLoader
 from schemas import DeleteFileResponse, IngestResponse, IngestStatusResponse
@@ -26,6 +33,11 @@ router = APIRouter(tags=["ingest"])
 
 # ── Hash registry ─────────────────────────────────────────────
 _HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
+
+# ── PDFs directory (A5) ───────────────────────────────────────
+# Same path as PDFS_DIR in config.py, resolved as a Path object.
+# data/pdfs/ is mounted at /pdfs by main.py.
+_PDFS_DIR  = Path(PDFS_DIR)
 
 
 def _load_hashes() -> dict:
@@ -51,6 +63,47 @@ def _remove_hash_for_file(filename: str) -> None:
     hashes  = _load_hashes()
     updated = {h: f for h, f in hashes.items() if f != filename}
     _save_hashes(updated)
+
+
+# ── NEW (A5): PDF file management ─────────────────────────────
+
+def _store_pdf_file(tmp_path: str, filename: str) -> Path | None:
+    """
+    Copy a PDF from the temporary upload path to data/pdfs/{filename}.
+
+    This makes the file available at /pdfs/{filename} for the frontend
+    PDF viewer (Person B, Task B1). The copy is idempotent — if the
+    same filename already exists (e.g. from a previous identical upload
+    that passed the hash check) we skip silently.
+
+    Returns the destination Path on success, None on error.
+    """
+    _PDFS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _PDFS_DIR / filename
+
+    try:
+        shutil.copy2(tmp_path, dest)
+        print(f"  [INGEST] PDF stored for viewer: data/pdfs/{filename}")
+        return dest
+    except Exception as e:
+        # Non-fatal: the PDF viewer just won't work for this file.
+        # Retrieval / chat still works normally.
+        print(f"  [INGEST] Warning: could not store PDF for viewer: {e}")
+        return None
+
+
+def _delete_pdf_file(filename: str) -> None:
+    """
+    Remove data/pdfs/{filename} when the document is deleted from the KB.
+    Silently skips if the file doesn't exist (e.g. non-PDF or failed store).
+    """
+    pdf_path = _PDFS_DIR / filename
+    if pdf_path.exists():
+        try:
+            pdf_path.unlink()
+            print(f"  [INGEST] PDF deleted from viewer store: data/pdfs/{filename}")
+        except Exception as e:
+            print(f"  [INGEST] Warning: could not delete PDF from viewer store: {e}")
 
 
 # ── Loader dispatch ───────────────────────────────────────────
@@ -116,7 +169,14 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         files_indexed.append(filename)
         hashes[fhash] = filename
 
-    # ── 4. Index ──────────────────────────────────────────
+        # ── 4. (A5) Copy PDF to viewer store ──────────────
+        # Done per-file, after successful load + chunk, before index.
+        # Only PDFs are supported by the loader anyway, but we guard
+        # on extension defensively so future loaders don't break this.
+        if Path(filename).suffix.lower() == ".pdf":
+            _store_pdf_file(tmp_path, filename)
+
+    # ── 5. Index ──────────────────────────────────────────
     if all_children:
         vector_store.add_documents(all_children)
         bm25_store.add(all_children)
@@ -179,6 +239,10 @@ async def delete_file(filename: str):
     result = await run_in_threadpool(rag_service.delete_file_from_stores, filename)
     _remove_hash_for_file(filename)
 
+    # ── (A5) Clean up the stored PDF ──────────────────────
+    # Remove from data/pdfs/ so the viewer can't serve a deleted doc.
+    _delete_pdf_file(filename)
+
     return DeleteFileResponse(
         status          = "ok",
         filename        = filename,
@@ -210,7 +274,6 @@ async def trigger_sync():
     if not settings.sync_manifest_url:
         return {"status": "skipped", "message": "SYNC_MANIFEST_URL not configured."}
 
-    # Run sync in background so the request returns immediately
     import asyncio
     asyncio.create_task(run_in_threadpool(sync.run))
     return {"status": "triggered", "message": "Sync started in background."}
