@@ -12,10 +12,33 @@
 #       reranker.rerank()                → top-N children  ← precise signal
 #       retriever.expand_to_parents()    → parent blobs (1500 tok) for LLM
 #
-#   OFFLINE mode unchanged: retrieve() returns child chunks, no reranker,
-#   no expansion — workers see the precise matched passage (actually better UX).
+# ── BUG 2 FIX — Online mode citations are inaccurate ─────────────────────
+#   PROBLEM:
+#     get_citations() returned one citation for every chunk in the retrieval
+#     result, even when 5 expanded chunks all came from the same parent
+#     passage.  The LLM may only have used 2 of the 5 contexts but all 5
+#     showed up as sources.  Additionally, because expand_to_parents() swaps
+#     content for parent_content but leaves all other metadata as the child's,
+#     the page reported in the citation was the child's page, not necessarily
+#     the page that contained the answer.
 #
-#   All other logic (stream/ask/online fallback/ChainResponse) identical.
+#   FIX (short-term, effective immediately):
+#     Deduplicate citations on parent_id — same parent passage → one citation.
+#     This eliminates the multiple-child-same-parent duplication and reduces
+#     noise significantly.  The page shown is still the child's page (the
+#     start of the parent passage) which is correct for the majority of cases.
+#
+# ── BUG 3 FIX — Offline mode shows unreadable 300-char child fragments ───
+#   PROBLEM:
+#     The offline branch of stream() built OfflineChunk objects using
+#     c.get("content", "") which is the 300-character child fragment.
+#     c["parent_content"] — the full 1500-char readable passage — was ignored.
+#
+#   FIX:
+#     Use  c.get("parent_content") or c.get("content", "")
+#     The `or` fallback handles atomic chunks (tables, images) where
+#     parent_content == content, so there is no regression for those types.
+# ──────────────────────────────────────────────────────────────────────────
 
 import os
 import sys
@@ -93,15 +116,40 @@ class ChainResponse:
         return self.answer
 
     def get_citations(self) -> list[dict]:
+        """
+        Return one citation per unique parent passage (deduplicated on parent_id).
+
+        BUG 2 FIX:
+        Previously every chunk in the retrieval result produced its own
+        citation, so a single parent passage retrieved via 3 different child
+        chunks would appear three times.  Now we track seen parent_ids and
+        only emit the first citation for each unique parent.
+
+        Fallback key: if parent_id is absent (e.g. naive / atomic chunks),
+        we fall back to (source, page) to avoid duplication there too.
+        """
         citations: list[dict] = []
+        seen: set[str]        = set()
+
         for chunk in self.retrieval.get_chunks():
+            # Build a deduplication key — prefer parent_id for hierarchical
+            # chunks; fall back to source+page for other chunker strategies.
+            dedup_key = chunk.get("parent_id") or (
+                f"{chunk.get('source', '')}|{chunk.get('page', '')}"
+            )
+
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
             citations.append({
-                "source"      : chunk.get("source", "unknown"),
-                "page"        : chunk.get("page", "?"),
-                "heading"     : chunk.get("heading", ""),
-                "section_path": chunk.get("section_path", ""),
-                "type"        : chunk.get("type", "text"),
+                "source"      : chunk.get("source",       "unknown"),
+                "page"        : chunk.get("page",          "?"),
+                "heading"     : chunk.get("heading",       ""),
+                "section_path": chunk.get("section_path",  ""),
+                "type"        : chunk.get("type",          "text"),
             })
+
         return citations
 
     def get_images(self) -> list[str]:
@@ -368,7 +416,14 @@ class RAGChain:
                     page         = c.get("page"),
                     heading      = c.get("heading", ""),
                     section_path = c.get("section_path", ""),
-                    content      = c.get("content", ""),
+                    # ── BUG 3 FIX ─────────────────────────────────────────
+                    # Previously used c.get("content") which is the raw 300-char
+                    # child fragment — unreadable mid-sentence snippets.
+                    # parent_content is the full 1500-char readable passage that
+                    # the hierarchical chunker stored inline on every child dict.
+                    # The `or` fallback handles atomic chunks (tables/images)
+                    # where parent_content == content — no regression there.
+                    content      = c.get("parent_content") or c.get("content", ""),
                     score        = round(float(c.get("score", 0.0)), 4),
                     chunk_type   = c.get("type", "text"),
                     bbox         = c.get("bbox"),

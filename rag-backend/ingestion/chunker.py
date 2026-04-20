@@ -1,16 +1,30 @@
 # ingestion/chunker.py
 #
-# CHANGES:
-#   - HierarchicalChunker.chunk_hierarchical() now embeds parent_content
-#     directly on each child chunk dict instead of returning a separate
-#     parents dict.
-#   - This eliminates the need for ParentStore (SQLite DB) entirely.
-#   - At retrieval time HybridRetriever reads chunk["parent_content"] from
-#     the Qdrant payload — zero extra DB query.
+# CHANGES vs previous version:
+#   - HierarchicalChunker.chunk_hierarchical() embeds parent_content
+#     directly on each child chunk dict (no separate parents dict / SQLite).
 #   - Return signature of chunk_hierarchical() changed:
 #       OLD: (children: list[dict], parents: dict)
 #       NEW: children: list[dict]   (parents embedded inline)
-#   - All other chunkers unchanged.
+#
+# ── BUG 1 FIX ─────────────────────────────────────────────────────────────
+#   _group_by_section() now also starts a new group whenever the PAGE NUMBER
+#   changes, in addition to the existing section_path / heading triggers.
+#
+#   ROOT CAUSE:
+#     When PDF heading detection fails (very common for ship manuals that use
+#     consistent font sizes with no clear size jumps), every block comes out
+#     with section_path="" and type="text".  Neither the heading nor the
+#     section_path trigger ever fires, so the ENTIRE document landed in one
+#     giant group.  That group's meta_base was stamped with group[0]["page"]
+#     (= page 1), so every child chunk across the whole PDF reported page 1.
+#
+#   FIX:
+#     Add a third OR-condition: `block.get("page") != current[-1].get("page")`
+#     This guarantees that blocks from different pages are always placed in
+#     separate groups, even if heading detection completely fails.
+#     Result: each chunk now carries the correct page number for its content.
+# ──────────────────────────────────────────────────────────────────────────
 
 import os
 import sys
@@ -259,8 +273,28 @@ class HierarchicalChunker(BaseChunker):
 
     @staticmethod
     def _group_by_section(blocks: list[dict]) -> list[list[dict]]:
+        """
+        Split a flat list of blocks into groups that will become separate
+        parent passages.
+
+        A new group is started when ANY of the following is true:
+          1. The block is a heading  — explicit section start
+          2. The section_path changes — heading breadcrumb changed
+          3. The PAGE NUMBER changes  — ← BUG 1 FIX
+
+        Condition 3 is the critical addition.  When PDF heading detection
+        fails (no clear font-size jumps), conditions 1 and 2 never fire,
+        causing the entire document to collapse into a single group.  All
+        children of that group then inherit group[0]["page"] = 1.
+
+        By also breaking on page changes we guarantee that blocks from
+        different pages always end up in different groups, so each child
+        chunk carries the correct page number even when section detection
+        is completely unavailable.
+        """
         if not blocks:
             return []
+
         groups: list[list[dict]] = []
         current: list[dict]      = [blocks[0]]
 
@@ -268,6 +302,7 @@ class HierarchicalChunker(BaseChunker):
             new_section = (
                 block.get("type") == "heading"
                 or block.get("section_path") != current[-1].get("section_path")
+                or block.get("page")         != current[-1].get("page")   # ← BUG 1 FIX
             )
             if new_section:
                 groups.append(current)
