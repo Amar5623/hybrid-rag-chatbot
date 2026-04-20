@@ -6,13 +6,19 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // Proxy API calls to backend
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
-        rewrite: path => path.replace(/^\/api/, ''),
+        rewrite: (path) => path.replace(/^\/api/, ''),
       },
-      // Images served as static files from FastAPI — proxy them too
+      // Proxy images
       '/images': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
+      // Proxy PDFs - THIS WAS MISSING OR INCORRECT
+      '/pdfs': {
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
