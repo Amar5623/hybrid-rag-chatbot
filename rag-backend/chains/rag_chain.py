@@ -256,36 +256,41 @@ class RAGChain:
     def _retrieve(self, question: str, is_offline: bool = False) -> RetrievalResult:
         """
         Run retrieval with the correct child-first / parent-expand order.
-
+ 
         OFFLINE mode:
             retrieve() → child chunks (300 tok) → return directly
             No reranking (CPU-intensive), no parent expansion.
-            Workers see the precise matched passage — better UX.
-
+ 
         ONLINE mode (A4 fix):
             retrieve() → child chunks (300 tok)
             [optional] rerank children → precise cross-encoder signal
             expand_to_parents()        → 1500-tok passages for LLM context
-
-        The separation of rerank and expand is the core of A4:
-            - Reranker gets small, precise chunks → higher signal per token
-            - LLM gets full parent passages       → coherent, complete context
-            - Both operations get the input they're best at
+ 
+        PHASE 4 CHANGE:
+            store=rag_service.get_vector_store() passed to retriever.retrieve()
+            so online calls use the cloud store and offline calls use local,
+            without rebuilding the chain on network state changes.
         """
+        # ── Phase 4: resolve active store on every call ────────────────────
+        # Imported inside the method to avoid circular import
+        # (rag_service imports RAGChain at module level).
+        import services.rag_service as _rag_svc
+        active_store = _rag_svc.get_vector_store()
+ 
         retrieval = self.retriever.retrieve(
             question,
             filter_field = "source" if self._source_filter else None,
             filter_value = self._source_filter,
             is_offline   = is_offline,
+            store        = active_store,              # ← the only new argument
         )
-
-        # ── OFFLINE: return child chunks directly ──────────
+ 
+        # ── OFFLINE: return child chunks directly ──────────────────────────
         if is_offline:
-            print(f"  [RAG CHAIN] Offline — returning {len(retrieval)} child chunks (no rerank, no expand)")
+            print(f"  [RAG CHAIN] Offline — returning {len(retrieval)} child chunks")
             return retrieval
-
-        # ── ONLINE: rerank children first (A4) ─────────────
-        # Step 1: Rerank against child content (300 tokens — precise match signal)
+ 
+        # ── ONLINE: rerank children first (A4) ────────────────────────────
         if self.use_reranker and self.reranker and len(retrieval) > 0:
             print(f"  [RAG CHAIN] Reranking {len(retrieval)} children...")
             retrieval = self.reranker.rerank(
@@ -293,17 +298,13 @@ class RAGChain:
                 retrieval = retrieval,
                 top_k     = self.rerank_top_k,
             )
-
-        # Step 2: Expand top-N children to parent passages for LLM context
-        # The retriever has parent_content stored inline on every chunk —
-        # this is a pure in-memory field lookup, no DB round-trip.
+ 
+        # ── Expand top-N children to parent passages ───────────────────────
         if hasattr(self.retriever, "expand_to_parents"):
             retrieval = self.retriever.expand_to_parents(retrieval)
         else:
-            # Graceful degradation: if retriever doesn't support expansion
-            # (e.g. NaiveRetriever), just use whatever chunks we have.
-            print("  [RAG CHAIN] expand_to_parents not available on this retriever — skipping")
-
+            print("  [RAG CHAIN] expand_to_parents not available — skipping")
+ 
         return retrieval
 
     # ── PROMPT BUILDING ───────────────────────────────────

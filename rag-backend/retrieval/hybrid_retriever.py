@@ -1,45 +1,32 @@
 # retrieval/hybrid_retriever.py
 #
-# CHANGES vs Day 2 version (Day 3 — A2):
-#   - _deduplicate() REPLACED by _mmr_deduplicate().
-#     The new method does exact dedup first (cheap), then applies
-#     Maximal Marginal Relevance (MMR) to ensure the final chunk set
-#     is semantically diverse — not just lexically non-duplicate.
+# CHANGES vs Day 3 version:
+#   Person A — Phase 4 (Day 5-6)
 #
-#   - Two new constructor params:
-#       use_mmr        : bool  = True   — toggle MMR on/off (useful for testing)
-#       mmr_threshold  : float = 0.82   — cosine sim ceiling. Chunks more similar
-#                                         than this to an already-accepted chunk
-#                                         are treated as redundant and skipped.
+#   ONE CHANGE ONLY — retrieve() now accepts an optional `store` parameter.
 #
-#   WHY MMR IS NEEDED:
-#     Ship manuals use large chunks with overlap (parent_chunk_size=1500,
-#     overlap=100). Two chunks from the same section can be 70-80% identical
-#     in content but survive exact-match dedup because their first 200 chars differ.
-#     Result: all 5 offline chunks say "cooling water must not exceed 60°C"
-#     in slightly different words, wasting the worker's limited reading time.
+#   WHY:
+#     The hybrid manager in rag_service keeps two store singletons:
+#     _local_store and _cloud_store. get_vector_store() returns whichever
+#     is active (cloud if online, local otherwise).
 #
-#     MMR fixes this by asking: "is this chunk telling us something NEW compared
-#     to what we've already accepted?" If not — skip it, pick the next candidate.
-#     Workers get 5 chunks from genuinely different sections of the manual.
+#     The chain was built once at startup with _local_store passed to
+#     HybridRetriever constructor. Once built, self.store was always local —
+#     even when online and cloud was preferred.
 #
-#   MMR ALGORITHM (greedy):
-#     1. Sort candidates by RRF score (already done before this step).
-#     2. Batch-embed all candidates in one forward pass.
-#     3. Always accept the top-ranked chunk first.
-#     4. For each subsequent candidate, compute cosine similarity to every
-#        already-accepted chunk. If max_sim < mmr_threshold → accept.
-#        Otherwise skip (it's redundant with something already accepted).
-#     5. If accepted set is still < top_k after scanning all candidates,
-#        backfill from the remainder (diversity is moot when options are scarce).
+#     Simplest fix: accept an optional `store` override in retrieve() so the
+#     caller (rag_chain._retrieve) can pass rag_service.get_vector_store()
+#     on each call. No constructor changes, no chain rebuild needed.
 #
-#   PERFORMANCE:
-#     The extra cost vs plain dedup is one embed_documents() batch call on
-#     fetch_k (20–40) candidate chunks. On bge-small-en-v1.5 on CPU this is
-#     ~100-200ms — acceptable since reranker (online) and BM25 take similar time.
-#     In offline mode there is no reranker, so the total latency budget is fine.
+#   HOW:
+#     retrieve(query, ..., store=None)
+#     active_store = store or self.store
 #
-#   Everything else (RRF, BM25, expand_to_parents, score_threshold) unchanged.
+#     rag_chain._retrieve() passes:
+#         import services.rag_service as _rag_svc
+#         retrieval = self.retriever.retrieve(..., store=_rag_svc.get_vector_store())
+#
+#   Everything else (RRF, BM25, MMR, expand_to_parents) unchanged.
 
 import os
 import sys
@@ -49,7 +36,8 @@ import numpy as np
 
 from retrieval.bm25_store      import BM25Store
 from retrieval.naive_retriever import RetrievalResult
-from vectorstore.qdrant_store  import QdrantVectorStore, BaseVectorStore
+from vectorstore.base          import BaseVectorStore
+from vectorstore.qdrant_store  import QdrantVectorStore
 from embeddings.embedder       import BaseEmbedder, EmbedderFactory
 from config                    import TOP_K, RRF_K
 
@@ -107,8 +95,6 @@ def reciprocal_rank_fusion(
     chunk_map : dict[str, dict]  = {}
 
     def _key(chunk: dict) -> str:
-        # Full content as key — safer than truncation.
-        # This is only for in-memory dict lookup, not persisted anywhere.
         return chunk.get("content", "").strip()
 
     for rank, chunk in enumerate(dense_results, start=1):
@@ -154,18 +140,21 @@ class HybridRetriever:
         embed query
         → BM25 + vector search
         → RRF fusion
-        → MMR deduplication  ← KEY: ensures 5 diverse manual sections
+        → MMR deduplication  ← ensures 5 diverse manual sections
         → return child chunks directly to worker
         (no reranker, no parent expansion)
 
     A2 CHANGE (Day 3):
         _deduplicate() replaced by _mmr_deduplicate().
-        Workers now see diverse chunks from different sections of the manual
-        instead of 5 overlapping passages from the same paragraph.
 
-    A4 CHANGE (Day 2 — unchanged):
-        _expand_to_parents() is not called inside retrieve().
+    A4 CHANGE (Day 2):
+        _expand_to_parents() not called inside retrieve().
         Use expand_to_parents(retrieval) AFTER reranking in online mode.
+
+    PHASE 4 CHANGE (Person A):
+        retrieve() accepts optional `store` parameter.
+        Enables rag_chain to pass rag_service.get_vector_store() per call
+        so online/offline store switching is transparent.
     """
 
     def __init__(
@@ -180,7 +169,6 @@ class HybridRetriever:
         score_threshold: float           = 0.0,
         bm25_path      : str             = None,
         parent_store                     = None,   # ignored — kept for compat
-        # ── NEW (A2) ────────────────────────────────────────
         use_mmr        : bool            = True,
         mmr_threshold  : float           = 0.70,
     ):
@@ -192,7 +180,6 @@ class HybridRetriever:
         self.sparse_weight   = sparse_weight
         self.deduplicate     = deduplicate
         self.score_threshold = score_threshold
-        # ── NEW (A2) ────────────────────────────────────────
         self.use_mmr         = use_mmr
         self.mmr_threshold   = mmr_threshold
 
@@ -206,7 +193,8 @@ class HybridRetriever:
             f"top_k={top_k} | rrf_k={rrf_k} | "
             f"dense={dense_weight} | sparse={sparse_weight} | "
             f"mmr={'✅' if use_mmr else '❌'} (threshold={mmr_threshold}) | "
-            f"parent_expansion=post-rerank (A4)"
+            f"parent_expansion=post-rerank (A4) | "
+            f"dynamic_store=✅ (Phase 4)"
         )
 
     # ── INDEX ─────────────────────────────────────────────
@@ -222,54 +210,61 @@ class HybridRetriever:
     def retrieve(
         self,
         query        : str,
-        top_k        : int  = None,
-        filter_field : str  = None,
-        filter_value : str  = None,
-        is_offline   : bool = False,
+        top_k        : int             = None,
+        filter_field : str             = None,
+        filter_value : str             = None,
+        is_offline   : bool            = False,
+        store        : BaseVectorStore = None,    # ← NEW (Phase 4)
     ) -> RetrievalResult:
         """
         Run hybrid retrieval and return RAW CHILD CHUNKS.
 
-        A2 CHANGE: dedup step is now _mmr_deduplicate() which:
-            1. Removes exact duplicates (cheap hash set)
-            2. Embeds remaining candidates in one batch call
-            3. Greedily selects top_k diverse chunks using cosine similarity
-
-        A4 CHANGE (Day 2): _expand_to_parents() not called here.
-            Online caller should: retrieve → rerank → expand_to_parents.
-            Offline caller gets child chunks directly (workers see precise match).
+        A2 CHANGE: dedup step is now _mmr_deduplicate().
+        A4 CHANGE: _expand_to_parents() not called here.
+        PHASE 4 CHANGE: optional `store` parameter overrides self.store.
 
         Args:
             query        : search string
             top_k        : override instance default
             filter_field : optional metadata field to filter by
             filter_value : value to match for filter_field
-            is_offline   : affects log message, passed to MMR for consistent logging
+            is_offline   : affects log message
+            store        : optional BaseVectorStore override. When provided,
+                           this store is used for the dense search instead of
+                           self.store. rag_chain._retrieve() passes
+                           rag_service.get_vector_store() here so online/offline
+                           store switching works without rebuilding the chain.
 
         Returns:
-            RetrievalResult — child chunks, MMR-diverse, sorted by initial RRF score
+            RetrievalResult — child chunks, MMR-diverse, sorted by RRF score
         """
         k       = top_k or self.top_k
         fetch_k = max(k * 3, 20)
 
-        # 1. Embed query — also used in MMR cosine comparison
+        # ── PHASE 4: use the provided store override if given ──────────────
+        # This is the only line that changed from the original retrieve().
+        # self.store is the local store (set at construction).
+        # `store` will be the cloud store when online — passed by rag_chain.
+        active_store = store or self.store
+
+        # 1. Embed query
         q_vec = self.embedder.embed_text(query)
 
-        # 2. Dense search
+        # 2. Dense search (uses active_store — may be cloud or local)
         if filter_field and filter_value:
-            dense_results = self.store.search_with_filter(
+            dense_results = active_store.search_with_filter(
                 query_vector = q_vec,
                 filter_by    = filter_field,
                 filter_val   = filter_value,
                 top_k        = fetch_k,
             )
         else:
-            dense_results = self.store.search(
+            dense_results = active_store.search(
                 query_vector = q_vec,
                 top_k        = fetch_k,
             )
 
-        # 3. BM25 search
+        # 3. BM25 search (always local — BM25 index is local)
         sparse_results = self.bm25.search(query=query, top_k=fetch_k)
 
         # 4. RRF fusion
@@ -285,9 +280,7 @@ class HybridRetriever:
         if self.score_threshold > 0:
             fused = [r for r in fused if r["score"] >= self.score_threshold]
 
-        # 6. Dedup + diversity
-        # CHANGED (A2): was _deduplicate(fused) + fused[:k]
-        #               now _mmr_deduplicate(fused, q_vec, k) which does both
+        # 6. Dedup + diversity (MMR)
         if self.deduplicate:
             fused = self._mmr_deduplicate(
                 chunks    = fused,
@@ -297,15 +290,12 @@ class HybridRetriever:
         else:
             fused = fused[:k]
 
-        # ── A4: NO _expand_to_parents() call here ──────────────
-        # Expansion happens in rag_chain._retrieve() AFTER reranking.
-        # ────────────────────────────────────────────────────────
-
         mode = "offline" if is_offline else "online (rerank + expand in chain)"
-        print(f"  [HYBRID] Returning {len(fused)} child chunks ({mode})")
+        store_tag = "cloud" if (store and store is not self.store) else "local"
+        print(f"  [HYBRID] {len(fused)} child chunks ({mode}, store={store_tag})")
         return RetrievalResult(fused)
 
-    # ── MMR DEDUPLICATION (A2) ─────────────────────────────
+    # ── MMR DEDUPLICATION ─────────────────────────────────
 
     def _mmr_deduplicate(
         self,
@@ -318,46 +308,27 @@ class HybridRetriever:
 
         Stage 1 — Exact dedup (O(n) hash set):
             Removes chunks with identical content strings.
-            Fast and always done regardless of use_mmr flag.
-            Needed because Qdrant and BM25 can return the same chunk.
 
-        Stage 2 — MMR greedy selection (O(n * accepted) cosine similarity):
+        Stage 2 — MMR greedy selection:
             Batch-embeds all remaining candidates in one forward pass.
             Greedily accepts chunks that are semantically diverse from
             everything already in the accepted set.
 
             Selection rule:
                 max_sim = max cosine_sim(candidate, s) for s in accepted
-                Accept candidate if max_sim < mmr_threshold (default 0.82)
-
-            The accepted set is ordered by original RRF score, not by MMR score.
-            This means: relevance is the primary sort, diversity is the filter.
-            We don't sacrifice the most relevant chunk for diversity — we just
-            make sure positions 2-5 aren't clones of position 1.
+                Accept candidate if max_sim < mmr_threshold (default 0.70)
 
         Backfill:
-            If fewer than top_k chunks survive MMR (rare — happens when corpus is
-            small or query is very narrow), we backfill from the remaining
-            candidates in RRF-score order. A chunk that's redundant is still
-            better than nothing.
+            If fewer than top_k chunks survive MMR, backfill from the
+            remainder (diversity is moot when options are scarce).
 
         Fallback:
-            If embedding the candidates fails (OOM, model error), we fall back
-            to pure score cutoff (fused[:top_k]). This never crashes — the
-            retrieval pipeline always returns something.
-
-        Args:
-            chunks    : RRF-fused candidates, sorted by score descending
-            query_vec : embedded query vector (already computed in retrieve())
-            top_k     : desired output size
-
-        Returns:
-            list of at most top_k chunks, MMR-diverse
+            If embedding candidates fails, fall back to score cutoff.
         """
         if not chunks:
             return []
 
-        # ── Stage 1: exact dedup ──────────────────────────────
+        # Stage 1: exact dedup
         seen_content: set        = set()
         unique      : list[dict] = []
         for c in chunks:
@@ -366,63 +337,48 @@ class HybridRetriever:
                 seen_content.add(content)
                 unique.append(c)
 
-        # If exact dedup already reduced us to <= top_k, we're done
         if len(unique) <= top_k:
             return unique
 
-        # If MMR is disabled, just use score cutoff on the exact-deduped list
         if not self.use_mmr:
             return unique[:top_k]
 
-        # ── Stage 2: MMR semantic dedup ───────────────────────
+        # Stage 2: MMR semantic dedup
         try:
-            texts         = [c["content"] for c in unique]
+            texts          = [c["content"] for c in unique]
             candidate_vecs = self.embedder.embed_documents(texts)
-            # embed_documents returns list of lists or numpy arrays — normalise
             candidate_vecs = [np.asarray(v, dtype=np.float32) for v in candidate_vecs]
         except Exception as e:
-            print(f"  [HYBRID/MMR] Embedding candidates failed ({e}) "
-                  f"— falling back to score cutoff")
+            print(f"  [HYBRID/MMR] Embedding failed ({e}) — falling back to score cutoff")
             return unique[:top_k]
 
-        # Greedy MMR selection
-        # accepted_indices: indices into `unique` of chosen chunks
-        # accepted_vecs   : their embedding vectors (for similarity computation)
-        accepted_indices: list[int]         = []
-        accepted_vecs   : list[np.ndarray]  = []
+        accepted_indices: list[int]        = []
+        accepted_vecs   : list[np.ndarray] = []
 
         for i, (chunk, vec) in enumerate(zip(unique, candidate_vecs)):
             if len(accepted_indices) >= top_k:
                 break
 
             if not accepted_indices:
-                # Always accept the top-ranked chunk unconditionally
                 accepted_indices.append(i)
                 accepted_vecs.append(vec)
                 continue
 
-            # Compute max cosine similarity to every already-accepted chunk
             max_sim = max(_cosine_sim(vec, av) for av in accepted_vecs)
 
             if max_sim < self.mmr_threshold:
-                # Low similarity → new information → accept
                 accepted_indices.append(i)
                 accepted_vecs.append(vec)
-            # else: too similar to something already accepted → skip (redundant)
 
-        # ── Backfill if accepted < top_k ─────────────────────
-        # This happens when the corpus is small or the query is very narrow
-        # (all remaining chunks are about the same sub-topic).
-        # We'd rather return a slightly redundant chunk than nothing.
+        # Backfill
         if len(accepted_indices) < top_k:
-            accepted_set   = set(accepted_indices)
+            accepted_set    = set(accepted_indices)
             remaining_count = top_k - len(accepted_indices)
-            backfill = [
+            backfill        = [
                 i for i in range(len(unique))
                 if i not in accepted_set
             ][:remaining_count]
             accepted_indices.extend(backfill)
-
             if backfill:
                 print(
                     f"  [HYBRID/MMR] Backfilled {len(backfill)} chunk(s) — "
@@ -431,47 +387,27 @@ class HybridRetriever:
 
         result = [unique[i] for i in accepted_indices]
         print(
-            f"  [HYBRID/MMR] {len(unique)} unique candidates → "
-            f"{len(result)} MMR-diverse chunks (threshold={self.mmr_threshold})"
+            f"  [HYBRID/MMR] {len(unique)} unique → "
+            f"{len(result)} MMR-diverse (threshold={self.mmr_threshold})"
         )
         return result
 
-    # ── PARENT EXPANSION (now a public method) ─────────────
+    # ── PARENT EXPANSION ──────────────────────────────────
 
     def expand_to_parents(self, retrieval: RetrievalResult) -> RetrievalResult:
         """
         PUBLIC wrapper — expands child chunks to parent context.
 
         Called by rag_chain._retrieve() in ONLINE mode, AFTER reranking.
-        Sequence in online mode:
-            1. retrieve()          → N children, RRF+MMR sorted
-            2. reranker.rerank()   → top-5 children, cross-encoder scored
-            3. expand_to_parents() → swap child.content for parent_content
-               so the LLM receives the full surrounding passage (~1500 tok)
-
-        Args:
-            retrieval: RetrievalResult of reranked child chunks
-
-        Returns:
-            New RetrievalResult with content replaced by parent_content
-            where available. Deduplicates on parent_id so two children
-            from the same parent don't send the same passage twice.
         """
         expanded = self._expand_to_parents(retrieval.get_chunks())
         print(f"  [HYBRID] Parent expansion: {len(retrieval)} → {len(expanded)} passages")
         return RetrievalResult(expanded)
 
-    # ── PARENT EXPANSION (private impl) ───────────────────
-
     def _expand_to_parents(self, chunks: list[dict]) -> list[dict]:
         """
         Replace each child's content with its parent_content if available.
-        parent_content is stored directly on the Qdrant payload by
-        HierarchicalChunker — no SQLite lookup needed.
-
-        Deduplicates on parent_id: if two children share the same parent,
-        only the first (higher-ranked) one is kept. The parent passage
-        already contains both children's text, so there's no info loss.
+        Deduplicates on parent_id.
         """
         expanded     : list[dict] = []
         seen_parents : set        = set()
@@ -499,16 +435,17 @@ class HybridRetriever:
 
     def get_info(self) -> dict:
         return {
-            "type"         : "HybridRetriever",
-            "top_k"        : self.top_k,
-            "rrf_k"        : self.rrf_k,
-            "dense_weight" : self.dense_weight,
-            "sparse_weight": self.sparse_weight,
-            "deduplicate"  : self.deduplicate,
-            "mmr_enabled"  : self.use_mmr,
-            "mmr_threshold": self.mmr_threshold,
-            "bm25_docs"    : len(self.bm25),
-            "parent_mode"  : "post-rerank-expansion (A4)",
+            "type"          : "HybridRetriever",
+            "top_k"         : self.top_k,
+            "rrf_k"         : self.rrf_k,
+            "dense_weight"  : self.dense_weight,
+            "sparse_weight" : self.sparse_weight,
+            "deduplicate"   : self.deduplicate,
+            "mmr_enabled"   : self.use_mmr,
+            "mmr_threshold" : self.mmr_threshold,
+            "bm25_docs"     : len(self.bm25),
+            "parent_mode"   : "post-rerank-expansion (A4)",
+            "dynamic_store" : "✅ (Phase 4)",
         }
 
 
