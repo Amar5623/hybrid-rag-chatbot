@@ -11,6 +11,26 @@
 //   - B4: Query keyword highlighting in chunk content
 //   - B5: Expand/collapse chunk content (3 lines default, "Show more" toggle)
 //   - B1/B2: Clickable "Open in manual" button opens PdfViewerModal (uses bbox when available)
+//
+// ── BUG 2 FIX (frontend) — Citations field name mismatch ───────────────────
+//   PROBLEM:
+//     The Citations component checked `c.chunk_type` to pick the icon (🖼/⊞/◈)
+//     but the backend sends the field as `c.type` — so chunk_type was always
+//     undefined and every citation showed the default ◈ icon regardless of
+//     whether the source was a table or image.
+//
+//   FIX:
+//     Use `c.type` (matching the backend's field name) for icon selection.
+//     The `|| c.chunk_type` fallback keeps backward compatibility in case
+//     any older cached response still has the old field name.
+//
+// ── BUG 3 (frontend side, automatic) ────────────────────────────────────────
+//   No code change needed here.  Bug 3 was fixed in rag_chain.py (backend):
+//   OfflineChunk.content is now the full parent_content (1500 chars) instead
+//   of the 300-char child fragment.  The existing OfflineChunkCard already
+//   handles long content correctly via the isLong / expand toggle — the cards
+//   will automatically show readable passages once the backend fix is deployed.
+// ─────────────────────────────────────────────────────────────────────────────
 
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
@@ -32,14 +52,23 @@ function Cursor() {
 
 function Citations({ citations }) {
   if (!citations?.length) return null
+
+  // Deduplicate on (source, page) as a frontend safety net.
+  // The backend already deduplicates by parent_id (Bug 2 fix), so this
+  // mostly handles the edge case of general / fallback responses where
+  // parent_id is absent and two chunks share the same source+page.
   const unique = citations.filter(
     (c, i, a) => a.findIndex(x => x.source === c.source && x.page === c.page) === i
   )
+
   return (
     <div style={{ marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 5 }}>
       {unique.map((c, i) => {
-        const icon    = c.chunk_type === 'image' ? '🖼' : c.chunk_type === 'table' ? '⊞' : '◈'
-        const section = c.section_path || c.heading || ''
+        // BUG 2 FIX: backend sends `type`, not `chunk_type`.
+        // Use `c.type` with a fallback to `c.chunk_type` for backward compat.
+        const chunkType = c.type || c.chunk_type || 'text'
+        const icon      = chunkType === 'image' ? '🖼' : chunkType === 'table' ? '⊞' : '◈'
+        const section   = c.section_path || c.heading || ''
         return (
           <span key={i} style={{
             display: 'inline-flex', alignItems: 'center', gap: 5,
@@ -173,6 +202,10 @@ function RelevanceBar({ score }) {
 }
 
 // ── Offline chunk card (B2 + B3 + B4 + B5) ────────────────────
+//
+// After Bug 3 is fixed in the backend, chunk.content here is the full
+// parent_content (up to 1500 chars) instead of a 300-char fragment.
+// isLong will correctly fire for most cards, giving users the expand toggle.
 function OfflineChunkCard({ chunk, index, query, onOpenPdf }) {
   const [expanded, setExpanded] = useState(false)
   const section  = chunk.section_path || chunk.heading || ''
