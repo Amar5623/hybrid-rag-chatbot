@@ -1,44 +1,31 @@
 # services/sync_service.py
 #
-# CHANGES vs previous version (VectorPullSyncService rewrite):
+# CHANGES vs previous version:
 #
-# FIX — Sync now works WITHOUT SYNC_MANIFEST_URL.
+#   Supabase Storage PDF sync (new — backward compatible):
 #
-#   OLD behaviour:
-#     The routers/sync.py trigger and network_monitor._on_reconnect both
-#     checked `if not settings.sync_manifest_url: return "skipped"`.
-#     This meant the entire sync was gated on a manifest URL that most
-#     deployments don't have — so the sync never ran even when Qdrant Cloud
-#     credentials were fully configured.
+#   _sync_pdfs() has been EXTENDED with a second download strategy.
+#   In addition to the existing manifest-based download, the sync engine now
+#   also downloads PDFs using source_url values stored in chunk payloads.
 #
-#   NEW behaviour:
-#     SYNC_MANIFEST_URL is now OPTIONAL.  The sync is split into two
-#     independent steps:
+#   New _sync_pdfs_from_source_urls() method:
+#     - Scans all locally-synced vector points for a "source_url" field.
+#     - Collects UNIQUE source_url values (many chunks share the same PDF URL).
+#     - Downloads each unique PDF only once via requests (streamed).
+#     - Saves to PDFS_DIR / <filename> so the frontend /pdfs/<filename> static
+#       mount continues to work for the offline PDF viewer.
+#     - If a PDF already exists on disk it is skipped (idempotent).
+#     - If a single download fails, it is logged and the rest continue.
+#     - Runs ONLY when source_url field is present in at least one point payload.
+#       Falls back gracefully (no error) when source_url is absent (old data).
 #
-#       STEP 1 — Vector sync (ALWAYS runs if cloud store is configured)
-#         Diffs cloud vs local Qdrant by point IDs.
-#         Pulls missing points from cloud into local — no re-embedding needed.
-#         Deletes local points that no longer exist in the cloud.
-#         This step requires: QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY
-#         (or LanceDB/Chroma cloud creds for other vendors).
-#         Does NOT require SYNC_MANIFEST_URL.
+#   _run_sync() now calls _sync_pdfs_from_source_urls() as STEP 2 (after vector
+#   sync), before the optional manifest-based PDF step (now STEP 3).
 #
-#       STEP 2 — PDF sync (ONLY runs if SYNC_MANIFEST_URL is set)
-#         Downloads missing PDF files from the manifest for the viewer.
-#         Skipped silently when SYNC_MANIFEST_URL is empty.
-#         Chat and retrieval work fine without PDFs — only the PDF viewer
-#         modal (frontend) is affected.
+#   Both STEP 2 and STEP 3 are independent; having one does not block the other.
+#   Local-only mode (no cloud store) is completely unaffected.
 #
-#       STEP 3 — BM25 rebuild (async, after any vector changes)
-#         Same as before.
-#
-#   SUMMARY:
-#     - Set QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY → vector sync works.
-#     - Set SYNC_MANIFEST_URL too → PDF files also download for the viewer.
-#     - Neither set → sync is skipped (cloud store not configured).
-#
-# BACKWARD COMPATIBILITY:
-#   SyncService alias preserved. All import sites unchanged.
+# Everything else (vector diff, BM25 rebuild, manifest fetch, logging) is UNCHANGED.
 
 import json
 import threading
@@ -64,13 +51,17 @@ class VectorPullSyncService:
       1. Compare point IDs in the cloud store vs local store.
       2. Pull any points that exist in cloud but not locally (no re-embedding).
       3. Delete any local points that were removed from the cloud.
-      4. Optionally download missing PDFs (only if SYNC_MANIFEST_URL is set).
-      5. Rebuild the BM25 index asynchronously.
+      4. [NEW] Download any PDFs whose source_url is stored in chunk payloads
+         but whose file is missing from data/pdfs/ (Supabase-powered download).
+      5. Optionally download missing PDFs via a SYNC_MANIFEST_URL (unchanged).
+      6. Rebuild the BM25 index asynchronously.
 
     Requirements:
       - Cloud vector store credentials (QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY
         for Qdrant, or LANCEDB_CLOUD_URI / CHROMA_HOST for other vendors).
-      - SYNC_MANIFEST_URL is optional — only needed for PDF file downloads.
+      - SYNC_MANIFEST_URL is optional — only needed for manifest-based PDF download.
+      - SUPABASE_URL / SUPABASE_SERVICE_KEY are optional — Supabase source_url
+        download works without them as long as the URL is a public HTTP URL.
 
     Thread-safe: only one sync runs at a time.
     """
@@ -87,7 +78,8 @@ class VectorPullSyncService:
         Main sync entry point. Thread-safe — only one sync runs at a time.
 
         Vector sync runs whenever cloud store creds are configured.
-        PDF sync runs only when SYNC_MANIFEST_URL is also set.
+        PDF sync (source_url) runs after vector sync when payloads contain it.
+        Manifest PDF sync runs only when SYNC_MANIFEST_URL is also set.
 
         Returns:
             Status dict with keys: status, vectors_added, vectors_deleted,
@@ -149,7 +141,7 @@ class VectorPullSyncService:
         if not cloud_configured:
             message = "Cloud store not configured (set QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY)"
         elif not self.manifest_url:
-            message = "Vector sync ready (SYNC_MANIFEST_URL not set — PDF download disabled)"
+            message = "Vector sync ready (SYNC_MANIFEST_URL not set — manifest PDF download disabled)"
         else:
             message = "Sync service ready"
 
@@ -191,22 +183,36 @@ class VectorPullSyncService:
             print(f"  [SYNC] ❌ {err}")
             errors.append(err)
 
-        # ── STEP 2: PDF sync (only when manifest URL is set) ───────────────
+        # ── STEP 2: PDF sync via source_url in chunk payloads ──────────────
+        # This is the new Supabase-powered download.  It runs whenever local
+        # vector points contain a non-empty "source_url" field (set at ingest
+        # time by _ingest_files_sync() when Supabase is configured).
+        # It does NOT require SYNC_MANIFEST_URL or any Supabase credentials —
+        # the URLs are public and downloadable with plain requests.
         pdfs_downloaded = 0
+        try:
+            pdfs_downloaded = self._sync_pdfs_from_source_urls(local, errors)
+        except Exception as e:
+            err = f"source_url PDF sync failed: {e}"
+            print(f"  [SYNC] ⚠  {err}")
+            errors.append(err)
+
+        # ── STEP 3: PDF sync via manifest (unchanged — only when URL set) ──
         if self.manifest_url:
             try:
-                pdfs_downloaded = self._sync_pdfs(local, errors)
+                extra = self._sync_pdfs(local, errors)
+                pdfs_downloaded += extra
             except Exception as e:
-                err = f"PDF sync failed: {e}"
+                err = f"Manifest PDF sync failed: {e}"
                 print(f"  [SYNC] ⚠  {err}")
                 errors.append(err)
         else:
             print(
-                "  [SYNC] PDF sync skipped — "
-                "SYNC_MANIFEST_URL not set (vector sync completed normally)"
+                "  [SYNC] Manifest PDF sync skipped — "
+                "SYNC_MANIFEST_URL not set (vector sync + source_url sync completed)"
             )
 
-        # ── STEP 3: BM25 rebuild (async, non-blocking) ─────────────────────
+        # ── STEP 4: BM25 rebuild (async, non-blocking) ─────────────────────
         if vectors_added > 0 or vectors_deleted > 0:
             try:
                 rag_svc.rebuild_bm25_async()
@@ -300,6 +306,141 @@ class VectorPullSyncService:
 
         return vectors_added, vectors_deleted
 
+    # ─────────────────────────────────────────────────────────────────────
+    # NEW: PDF sync via source_url stored in chunk payloads
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _sync_pdfs_from_source_urls(self, local, errors: list[str]) -> int:
+        """
+        Download PDFs whose public URL is stored in chunk payload["source_url"].
+
+        This is the primary PDF download path when Supabase Storage is used.
+        It is fully decoupled from SYNC_MANIFEST_URL — the public URLs come
+        directly from the vector store payloads that were written at ingest time.
+
+        Algorithm:
+          1. Fetch all local point payloads that include "source_url".
+          2. Build a mapping of unique source_url → filename.
+             (Many chunks share the same source_url — we download each PDF once.)
+          3. For each unique URL whose file is missing from PDFS_DIR:
+             - Stream-download the PDF using requests.
+             - Save to PDFS_DIR / filename.
+             - If download fails, log and continue (non-fatal).
+
+        Returns number of PDFs newly downloaded.
+        """
+        from config import PDFS_DIR
+        import requests
+
+        pdfs_dir = Path(PDFS_DIR)
+        pdfs_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Collect all local point payloads ───────────────────────────────
+        try:
+            # get_all_ids supports requesting specific payload fields.
+            # We request both "source" and "source_url" so we can map
+            # filename → URL without fetching full vectors.
+            all_entries = local.get_all_ids(
+                with_payload_fields=["source", "source_url"]
+            )
+        except Exception as e:
+            print(f"  [SYNC/source_url] ⚠  Could not list local points: {e}")
+            return 0
+
+        if not all_entries:
+            print("  [SYNC/source_url] No local points — skipping source_url PDF sync")
+            return 0
+
+        # ── Build unique URL → filename mapping ────────────────────────────
+        # Deduplicate by source_url (many chunks share the same PDF).
+        # Fallback filename: derived from the URL's last path segment.
+        url_to_filename: dict[str, str] = {}
+
+        for entry in all_entries:
+            # get_all_ids() returns dicts like:
+            #   {"id": "abc-123", "source": "engine.pdf", "source_url": "https://..."}
+            # The requested with_payload_fields values are at the TOP LEVEL of each
+            # entry dict, NOT nested under a "payload" key.
+            source_url = (entry.get("source_url") or "").strip()
+            source     = (entry.get("source")     or "").strip()
+
+            if not source_url:
+                continue   # chunk predates Supabase integration — skip silently
+
+            if source_url in url_to_filename:
+                continue   # already mapped
+
+            # Determine the local filename for this URL.
+            # Prefer the "source" field (original filename).
+            # Fall back to the last URL segment.
+            if source:
+                filename = source
+            else:
+                filename = source_url.rstrip("/").split("/")[-1]
+
+            if filename:
+                url_to_filename[source_url] = filename
+
+        if not url_to_filename:
+            print(
+                "  [SYNC/source_url] No source_url fields found in local payloads — "
+                "Supabase PDF sync skipped (pre-Supabase data or Supabase not configured)"
+            )
+            return 0
+
+        print(
+            f"  [SYNC/source_url] Found {len(url_to_filename)} unique PDF URL(s) "
+            f"across {len(all_entries)} local points"
+        )
+
+        # ── Download missing PDFs ──────────────────────────────────────────
+        downloaded = 0
+
+        for url, filename in url_to_filename.items():
+            dest_path = pdfs_dir / filename
+
+            if dest_path.exists():
+                print(f"  [SYNC/source_url] Already on disk — skipping: {filename}")
+                continue
+
+            # Stream download (safe for large files)
+            try:
+                print(f"  [SYNC/source_url] Downloading '{filename}' from {url}")
+                with requests.get(url, stream=True, timeout=self.timeout) as resp:
+                    resp.raise_for_status()
+                    with open(dest_path, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                fh.write(chunk)
+
+                print(f"  [SYNC/source_url] ✅ Saved: {filename}")
+                downloaded += 1
+
+            except Exception as e:
+                err = f"PDF download failed for '{filename}' ({url}): {e}"
+                print(f"  [SYNC/source_url] ⚠  {err}")
+                errors.append(err)
+
+                # Remove partial / corrupt file so next sync retries it
+                if dest_path.exists():
+                    try:
+                        dest_path.unlink()
+                    except Exception:
+                        pass
+
+        if downloaded:
+            print(
+                f"  [SYNC/source_url] ✅ Downloaded {downloaded} PDF(s) via source_url"
+            )
+        elif url_to_filename:
+            print("  [SYNC/source_url] All PDFs already present on disk — nothing to download")
+
+        return downloaded
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Existing manifest-based PDF sync (UNCHANGED)
+    # ─────────────────────────────────────────────────────────────────────
+
     def _sync_pdfs(self, local, errors: list[str]) -> int:
         """
         Download PDFs that exist in the local vector store but not on disk.
@@ -356,7 +497,7 @@ class VectorPullSyncService:
                 errors.append(err)
 
         if downloaded:
-            print(f"  [SYNC] ✅ Downloaded {downloaded} PDF(s)")
+            print(f"  [SYNC] ✅ Downloaded {downloaded} PDF(s) via manifest")
         return downloaded
 
     def _fetch_manifest(self) -> dict:

@@ -1,40 +1,24 @@
 # routers/ingest.py
 #
-# CHANGES vs previous version (A5):
-#   - _ingest_files_sync(): PDF copied to data/pdfs/ for static serving.
-#   - _delete_pdf_file(): removes data/pdfs/{filename} on delete.
-#   - delete_file endpoint: calls _delete_pdf_file() on deletion.
+# CHANGES vs previous version:
 #
-# FIX — Delete behaviour is now cloud-aware:
+#   Supabase Storage integration (new — backward compatible):
+#     After a PDF is successfully chunked and indexed, it is uploaded to the
+#     configured Supabase public bucket.  The permanent public URL is then
+#     injected into every chunk's metadata as "source_url" before the chunks
+#     are written to the vector store.
 #
-#   OLD behaviour:
-#     DELETE /ingest/{filename} always deleted from _local_store regardless
-#     of network state or whether a cloud store was configured. This meant:
-#       - Vectors were wiped from local disk even when online (cloud still had them)
-#       - Next sync would re-pull the "deleted" file straight back from cloud
-#       - Deletion was silently inconsistent — appeared to work, data came back
+#     If Supabase is NOT configured (SUPABASE_URL / SUPABASE_SERVICE_KEY empty),
+#     the upload step is skipped silently and "source_url" is set to "" so
+#     existing behaviour is completely unchanged.
 #
-#   NEW behaviour:
-#     Case 1 — Online + cloud configured:
-#       Delete from CLOUD ONLY.
-#       Also deletes BM25 entry and local PDF file immediately.
-#       Local vectors are NOT deleted now — next sync will remove them via
-#       the cloud→local diff (to_delete = local_ids - cloud_ids).
-#       This is intentional: the sync engine is the single source of truth
-#       for local vector state when a cloud is configured.
+#   Key changes inside _ingest_files_sync():
+#     1. After chunking, call upload_pdf_to_supabase(tmp_path) → public_url.
+#     2. Inject "source_url": public_url into every chunk dict.
+#     3. Then index as before.
 #
-#     Case 2 — Offline OR no cloud configured:
-#       Return HTTP 503 — deletion is blocked.
-#       Reason: if you delete locally and then come back online, sync would
-#       re-pull the deleted file from cloud (cloud is authoritative).
-#       Allowing local-only deletes would create a permanently diverged state.
-#
-#     Case 3 — No cloud configured at all (pure local deployment):
-#       The cloud check returns None, so the endpoint blocks with 503.
-#       In a pure-local deployment (no QDRANT_CLOUD_URL), you can re-enable
-#       local deletion by setting VECTOR_STORE_VENDOR=qdrant with no cloud URL
-#       and removing the cloud guard — but for this hybrid deployment,
-#       cloud is the authoritative store.
+# Everything else (duplicate detection, PDF viewer copy, delete logic,
+# hash registry, etc.) is UNCHANGED.
 
 import hashlib
 import json
@@ -122,6 +106,29 @@ def _get_loader(tmp_path: str, filename: str):
 # ── Core ingest logic (runs in threadpool) ────────────────────
 
 def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
+    """
+    Ingest one or more files into the vector store.
+
+    For each PDF:
+      1. Duplicate check (SHA-256).
+      2. Load blocks via PDFLoader.
+      3. Chunk (hierarchical or other strategy).
+      4. [NEW] Upload to Supabase Storage → get public_url (skipped if not configured).
+      5. [NEW] Inject source_url into every chunk dict.
+      6. Add chunks to vector store + BM25.
+      7. Copy PDF to data/pdfs/ for the local viewer.
+
+    The source_url field is "" when Supabase is not configured so downstream
+    code (sync engine, frontend) can safely check its truthiness.
+    """
+    # ── Import Supabase helper (lazy — avoids import errors if requests not installed)
+    try:
+        from services.supabase_storage import upload_pdf_to_supabase
+        _supabase_import_ok = True
+    except ImportError:
+        _supabase_import_ok = False
+        print("  [INGEST] ⚠  supabase_storage import failed — Supabase upload disabled")
+
     hashes       = _load_hashes()
     chunker      = _svc.get_chunker()
     vector_store = rag_service.get_vector_store()
@@ -131,7 +138,7 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
     skipped       : list[str] = []
     all_children  : list[dict] = []
 
-    # Save original PDF for viewer
+    # Save original PDF for viewer (early pass — keeps existing behaviour)
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for tmp_path_str, filename in file_paths:
@@ -177,15 +184,48 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         else:
             children = chunker.chunk_documents(blocks)
 
+        # ── 4. Upload to Supabase Storage ─────────────────
+        # Attempt upload only for PDFs and only when Supabase is configured.
+        # On failure we log and continue — ingestion is not blocked.
+        source_url = ""
+        if _supabase_import_ok and Path(filename).suffix.lower() == ".pdf":
+            try:
+                public_url = upload_pdf_to_supabase(tmp_path)
+                if public_url:
+                    source_url = public_url
+                    # Log once per file (not per chunk)
+                    print(
+                        f"  [INGEST] [SUPABASE] source_url set for "
+                        f"'{filename}': {source_url}"
+                    )
+                else:
+                    print(
+                        f"  [INGEST] [SUPABASE] Upload returned None for "
+                        f"'{filename}' — source_url left empty"
+                    )
+            except Exception as exc:
+                print(
+                    f"  [INGEST] [SUPABASE] Upload exception for "
+                    f"'{filename}': {exc} — continuing without source_url"
+                )
+
+        # ── 5. Inject source_url into every chunk ─────────
+        # This happens regardless of whether upload succeeded:
+        #   - source_url = "<public_url>"  → Supabase upload succeeded
+        #   - source_url = ""              → Supabase not configured or failed
+        # Downstream code can always do: chunk.get("source_url") or ""
+        for child in children:
+            child["source_url"] = source_url
+
         all_children.extend(children)
         files_indexed.append(filename)
         hashes[fhash] = filename
 
-        # ── 4. Copy PDF to viewer store ───────────────────
+        # ── 6. Copy PDF to local viewer store ────────────
         if Path(filename).suffix.lower() == ".pdf":
             _store_pdf_file(tmp_path, filename)
 
-    # ── 5. Index ──────────────────────────────────────────
+    # ── 7. Index all chunks ───────────────────────────────
     if all_children:
         vector_store.add_documents(all_children)
         bm25_store.add(all_children)
@@ -287,9 +327,6 @@ async def delete_file(filename: str):
         )
 
     # ── Guard 3: file must exist in cloud ─────────────────
-    # Check cloud specifically — not the local store — because cloud is
-    # the source of truth. The file may already be gone locally (e.g. after
-    # a partial sync failure) but still exist in cloud.
     cloud_sources = cloud_store.list_sources()
     if filename not in cloud_sources:
         raise HTTPException(
@@ -301,10 +338,6 @@ async def delete_file(filename: str):
     result = await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
 
     # ── Clean up local side effects immediately ───────────
-    # BM25 index: remove entries for this source so queries stop returning
-    # stale results before the next sync completes.
-    # Local vectors: intentionally NOT deleted here — the sync engine will
-    # handle them on the next run (to_delete = local_ids - cloud_ids).
     _remove_hash_for_file(filename)
     _delete_pdf_file(filename)
 
