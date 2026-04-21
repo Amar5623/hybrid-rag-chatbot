@@ -1,17 +1,40 @@
 # routers/ingest.py
 #
-# CHANGES vs previous version (Day 2 — A5):
-#   - _ingest_files_sync(): after hashing + loading, the PDF is now copied to
-#     data/pdfs/{filename} for static serving. This enables the PDF viewer
-#     modal (Person B, Task B1) to fetch and render the original document.
+# CHANGES vs previous version (A5):
+#   - _ingest_files_sync(): PDF copied to data/pdfs/ for static serving.
+#   - _delete_pdf_file(): removes data/pdfs/{filename} on delete.
+#   - delete_file endpoint: calls _delete_pdf_file() on deletion.
 #
-#   - _delete_pdf_file(): new helper that removes data/pdfs/{filename}
-#     when a file is deleted from the knowledge base.
+# FIX — Delete behaviour is now cloud-aware:
 #
-#   - delete_file endpoint: now also calls _delete_pdf_file() so the
-#     stored PDF is cleaned up alongside vectors and BM25 entries.
+#   OLD behaviour:
+#     DELETE /ingest/{filename} always deleted from _local_store regardless
+#     of network state or whether a cloud store was configured. This meant:
+#       - Vectors were wiped from local disk even when online (cloud still had them)
+#       - Next sync would re-pull the "deleted" file straight back from cloud
+#       - Deletion was silently inconsistent — appeared to work, data came back
 #
-#   Everything else unchanged (duplicate check, chunking, indexing).
+#   NEW behaviour:
+#     Case 1 — Online + cloud configured:
+#       Delete from CLOUD ONLY.
+#       Also deletes BM25 entry and local PDF file immediately.
+#       Local vectors are NOT deleted now — next sync will remove them via
+#       the cloud→local diff (to_delete = local_ids - cloud_ids).
+#       This is intentional: the sync engine is the single source of truth
+#       for local vector state when a cloud is configured.
+#
+#     Case 2 — Offline OR no cloud configured:
+#       Return HTTP 503 — deletion is blocked.
+#       Reason: if you delete locally and then come back online, sync would
+#       re-pull the deleted file from cloud (cloud is authoritative).
+#       Allowing local-only deletes would create a permanently diverged state.
+#
+#     Case 3 — No cloud configured at all (pure local deployment):
+#       The cloud check returns None, so the endpoint blocks with 503.
+#       In a pure-local deployment (no QDRANT_CLOUD_URL), you can re-enable
+#       local deletion by setting VECTOR_STORE_VENDOR=qdrant with no cloud URL
+#       and removing the cloud guard — but for this hybrid deployment,
+#       cloud is the authoritative store.
 
 import hashlib
 import json
@@ -35,8 +58,6 @@ router = APIRouter(tags=["ingest"])
 _HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
 
 # ── PDFs directory (A5) ───────────────────────────────────────
-# Same path as PDFS_DIR in config.py, resolved as a Path object.
-# data/pdfs/ is mounted at /pdfs by main.py.
 _PDFS_DIR  = Path(PDFS_DIR)
 
 
@@ -65,38 +86,21 @@ def _remove_hash_for_file(filename: str) -> None:
     _save_hashes(updated)
 
 
-# ── NEW (A5): PDF file management ─────────────────────────────
+# ── PDF file management (A5) ──────────────────────────────────
 
 def _store_pdf_file(tmp_path: str, filename: str) -> Path | None:
-    """
-    Copy a PDF from the temporary upload path to data/pdfs/{filename}.
-
-    This makes the file available at /pdfs/{filename} for the frontend
-    PDF viewer (Person B, Task B1). The copy is idempotent — if the
-    same filename already exists (e.g. from a previous identical upload
-    that passed the hash check) we skip silently.
-
-    Returns the destination Path on success, None on error.
-    """
     _PDFS_DIR.mkdir(parents=True, exist_ok=True)
     dest = _PDFS_DIR / filename
-
     try:
         shutil.copy2(tmp_path, dest)
         print(f"  [INGEST] PDF stored for viewer: data/pdfs/{filename}")
         return dest
     except Exception as e:
-        # Non-fatal: the PDF viewer just won't work for this file.
-        # Retrieval / chat still works normally.
         print(f"  [INGEST] Warning: could not store PDF for viewer: {e}")
         return None
 
 
 def _delete_pdf_file(filename: str) -> None:
-    """
-    Remove data/pdfs/{filename} when the document is deleted from the KB.
-    Silently skips if the file doesn't exist (e.g. non-PDF or failed store).
-    """
     pdf_path = _PDFS_DIR / filename
     if pdf_path.exists():
         try:
@@ -112,7 +116,7 @@ def _get_loader(tmp_path: str, filename: str):
     ext = Path(filename).suffix.lower()
     if ext == ".pdf":
         return PDFLoader(tmp_path)
-    return None   # only PDFs supported now
+    return None
 
 
 # ── Core ingest logic (runs in threadpool) ────────────────────
@@ -127,14 +131,13 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
     skipped       : list[str] = []
     all_children  : list[dict] = []
 
-    # === Minimal addition: save original PDF for viewer ===
+    # Save original PDF for viewer
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for tmp_path_str, filename in file_paths:
         tmp_path = Path(tmp_path_str)
         if tmp_path.exists():
             shutil.copy2(tmp_path, pdfs_dir / filename)
-    # ====================================================
 
     for tmp_path, filename in file_paths:
         # ── 1. Duplicate check ────────────────────────────
@@ -178,10 +181,7 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         files_indexed.append(filename)
         hashes[fhash] = filename
 
-        # ── 4. (A5) Copy PDF to viewer store ──────────────
-        # Done per-file, after successful load + chunk, before index.
-        # Only PDFs are supported by the loader anyway, but we guard
-        # on extension defensively so future loaders don't break this.
+        # ── 4. Copy PDF to viewer store ───────────────────
         if Path(filename).suffix.lower() == ".pdf":
             _store_pdf_file(tmp_path, filename)
 
@@ -204,8 +204,7 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest(files: list[UploadFile] = File(...)):
-    # === SAFE ORIGINAL PDF STORAGE FOR PDF VIEWER ===
-    # This runs in the already-async function - no structure change
+    # Save original PDFs for the viewer before processing
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for file in files:
@@ -214,9 +213,8 @@ async def ingest(files: list[UploadFile] = File(...)):
             content = await file.read()
             with open(dest_path, "wb") as f:
                 f.write(content)
-            await file.seek(0)   # Important: reset file pointer for original code
-    # ================================================
-    
+            await file.seek(0)
+
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
@@ -250,19 +248,64 @@ async def ingest(files: list[UploadFile] = File(...)):
 
 @router.delete("/ingest/{filename}", response_model=DeleteFileResponse)
 async def delete_file(filename: str):
-    vector_store = rag_service.get_vector_store()
-    sources = vector_store.list_sources()
-    if filename not in sources:
+    """
+    Delete a file from the knowledge base.
+
+    RULES:
+      - Must be ONLINE to delete (cloud is authoritative).
+      - Must have a cloud store configured (QDRANT_CLOUD_URL set).
+      - Deletes from CLOUD only — local vectors are cleaned up by the
+        next sync run (sync engine diffs cloud vs local and removes stale points).
+      - BM25 index and local PDF file are cleaned up immediately.
+
+    BLOCKED when:
+      - User is offline (network monitor says no connectivity).
+      - No cloud store is configured (pure local deployment has no sync,
+        so deleting locally would cause permanent data divergence on reconnect).
+    """
+
+    # ── Guard 1: must be online ───────────────────────────
+    if not rag_service.is_online():
         raise HTTPException(
-            status_code = status.HTTP_404_NOT_FOUND,
-            detail      = f"File '{filename}' not found in the knowledge base.",
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail      = (
+                f"Cannot delete '{filename}' while offline. "
+                "Deletion requires a cloud connection so the change is "
+                "applied to the authoritative store. Please reconnect and try again."
+            ),
         )
 
-    result = await run_in_threadpool(rag_service.delete_file_from_stores, filename)
-    _remove_hash_for_file(filename)
+    # ── Guard 2: cloud store must be configured ───────────
+    cloud_store = rag_service.get_cloud_store()
+    if cloud_store is None:
+        raise HTTPException(
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail      = (
+                f"Cannot delete '{filename}': no cloud store is configured. "
+                "Set QDRANT_CLOUD_URL and QDRANT_CLOUD_API_KEY in .env to enable deletion."
+            ),
+        )
 
-    # ── (A5) Clean up the stored PDF ──────────────────────
-    # Remove from data/pdfs/ so the viewer can't serve a deleted doc.
+    # ── Guard 3: file must exist in cloud ─────────────────
+    # Check cloud specifically — not the local store — because cloud is
+    # the source of truth. The file may already be gone locally (e.g. after
+    # a partial sync failure) but still exist in cloud.
+    cloud_sources = cloud_store.list_sources()
+    if filename not in cloud_sources:
+        raise HTTPException(
+            status_code = status.HTTP_404_NOT_FOUND,
+            detail      = f"File '{filename}' not found in the cloud knowledge base.",
+        )
+
+    # ── Delete from cloud ─────────────────────────────────
+    result = await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
+
+    # ── Clean up local side effects immediately ───────────
+    # BM25 index: remove entries for this source so queries stop returning
+    # stale results before the next sync completes.
+    # Local vectors: intentionally NOT deleted here — the sync engine will
+    # handle them on the next run (to_delete = local_ids - cloud_ids).
+    _remove_hash_for_file(filename)
     _delete_pdf_file(filename)
 
     return DeleteFileResponse(
@@ -270,8 +313,9 @@ async def delete_file(filename: str):
         filename        = filename,
         vectors_deleted = result["vectors_deleted"],
         message         = (
-            f"Deleted '{filename}': "
-            f"{result['vectors_deleted']} vectors removed."
+            f"Deleted '{filename}' from cloud: "
+            f"{result['vectors_deleted']} vectors removed. "
+            f"Local vectors will be cleaned up on next sync."
         ),
     )
 
@@ -289,12 +333,12 @@ async def trigger_sync():
     """
     Manually trigger a sync check.
     Called automatically by NetworkMonitor when internet is detected.
-    Kicks off SyncService to fetch manifest and pull new PDFs.
     """
     from services.sync_service import SyncService
     sync = SyncService()
-    if not settings.sync_manifest_url:
-        return {"status": "skipped", "message": "SYNC_MANIFEST_URL not configured."}
+
+    if rag_service.get_cloud_store() is None:
+        return {"status": "skipped", "message": "Cloud store not configured."}
 
     import asyncio
     asyncio.create_task(run_in_threadpool(sync.run))

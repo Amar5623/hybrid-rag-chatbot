@@ -1,51 +1,28 @@
 # services/rag_service.py
 #
-# Person A — Phase 4 (Day 5-6)
+# CHANGE vs previous version:
 #
-# CHANGES vs previous version:
+#   NEW FUNCTION: delete_file_from_cloud(filename)
 #
-#   1. FACTORY WIRING
-#      _build_vector_store() now calls vectorstore.factory.get_vector_store()
-#      instead of directly instantiating QdrantVectorStore.
-#      One env var change (VECTOR_STORE_VENDOR=lancedb) switches the backend.
+#     Deletes a file's vectors from the CLOUD store only.
+#     Also removes BM25 entries immediately (local side-effect cleanup).
+#     Does NOT touch _local_store — local vectors are cleaned up by the
+#     next sync run via the cloud→local diff.
 #
-#   2. HYBRID MANAGER — two store singletons
-#      _local_store  : BaseVectorStore — always initialised (local mode)
-#      _cloud_store  : BaseVectorStore — initialised only if cloud creds set
+#     Called by: routers/ingest.py DELETE /ingest/{filename}
+#     Preconditions enforced by the router before calling this:
+#       - is_online() is True
+#       - get_cloud_store() is not None
+#       - filename exists in cloud_store.list_sources()
 #
-#      get_vector_store() returns the cloud store when online + configured,
-#      otherwise falls back to the local store.  The rest of the codebase
-#      (routers, retrievers) calls get_vector_store() and gets the right one
-#      transparently.
+#   KEPT UNCHANGED: delete_file_from_stores(filename)
+#     Still deletes from _local_store + BM25.
+#     Used by wipe endpoint and internal tools only.
 #
-#   3. DYNAMIC STORE IN RETRIEVER
-#      HybridRetriever.retrieve() now accepts an optional `store` parameter.
-#      rag_chain._retrieve() passes rag_service.get_vector_store() each call.
-#      This means the retriever always uses whichever store is current
-#      (online=cloud, offline=local) without rebuilding the chain.
+#   Also carries forward the BM25 rebuild fix:
+#     new_bm25.build(chunks) not new_bm25.index_chunks(chunks)
 #
-#      NOTE: chains/rag_chain.py also needs a one-line change — see the
-#            "REQUIRED CHAIN CHANGE" comment below.  The change is minimal:
-#            pass `store=rag_service.get_vector_store()` to retriever.retrieve().
-#
-#   4. get_reranker() ACCESSOR
-#      Added alongside existing get_vector_store(), get_bm25_store() etc.
-#      Person B's chat.py offline reranker change calls this.
-#
-#   5. NETWORK MONITOR CONFIG
-#      poll_interval and timeout now read from settings (Person B's Day 1 change).
-#
-# REQUIRED CHAIN CHANGE (in chains/rag_chain.py — minimal edit):
-#   In RAGChain._retrieve(), change:
-#       retrieval = self.retriever.retrieve(question, ...)
-#   to:
-#       import services.rag_service as rag_service
-#       retrieval = self.retriever.retrieve(
-#           question,
-#           ...,
-#           store=rag_service.get_vector_store(),   # ← add this
-#       )
-#   See retrieval/hybrid_retriever.py for the `store` parameter addition.
+# All other code is UNCHANGED from the original.
 
 import threading
 from pathlib import Path
@@ -64,30 +41,19 @@ from chains.rag_chain           import RAGChain
 # ── Singletons ────────────────────────────────────────────────────────────────
 _embedder        : object = None
 _reranker        : object = None
-_local_store     : object = None   # always available (local disk)
-_cloud_store     : object = None   # None unless cloud creds are set
+_local_store     : object = None
+_cloud_store     : object = None
 _bm25_store      : object = None
 _chain           : object = None
 _network_monitor : object = None
 
 _lock = threading.Lock()
-
-# ── Background task registry ──────────────────────────────────────────────────
 _tasks: dict = {}
 
 
 # ── HYBRID STORE ACCESSOR ─────────────────────────────────────────────────────
 
 def get_vector_store() -> BaseVectorStore:
-    """
-    Return the active vector store.
-
-    Online + cloud configured → cloud store (authoritative)
-    Otherwise                 → local store (offline-safe fallback)
-
-    Called on every request so the chain always uses the correct store
-    without needing to restart.
-    """
     if _cloud_store is not None and is_online():
         return _cloud_store
     return _local_store
@@ -102,23 +68,14 @@ def _build_local_store(embedder) -> BaseVectorStore:
 
 
 def _build_cloud_store(embedder) -> BaseVectorStore | None:
-    """
-    Build the cloud store for the configured vendor.
-    Returns None if no cloud credentials are set — safe fallback.
-    """
     vendor = settings.vector_store_vendor
 
-    # Qdrant cloud requires URL
     if vendor == "qdrant" and not settings.qdrant_cloud_url:
         print("  [SERVICE] Cloud store skipped — QDRANT_CLOUD_URL not set")
         return None
-
-    # LanceDB cloud requires cloud URI
     if vendor == "lancedb" and not settings.lancedb_cloud_uri:
         print("  [SERVICE] Cloud store skipped — LANCEDB_CLOUD_URI not set")
         return None
-
-    # Chroma cloud requires host
     if vendor in ("chroma", "chromadb") and not settings.chroma_host:
         print("  [SERVICE] Cloud store skipped — CHROMA_HOST not set")
         return None
@@ -140,7 +97,7 @@ def _build_llm():
     provider = settings.llm_provider.lower().strip()
 
     if provider == "ollama":
-        import generation.ollama_llm  # noqa: F401 — registers into factory
+        import generation.ollama_llm  # noqa: F401
         print(f"  [SERVICE] LLM          : Ollama local (model='{settings.ollama_model}')")
         return LLMFactory.get("ollama")
 
@@ -161,7 +118,6 @@ def _build_chunker():
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 
 async def startup() -> None:
-    """Called once at FastAPI startup. Initialises all singletons."""
     global _embedder, _reranker, _local_store, _cloud_store, \
            _bm25_store, _chain, _network_monitor
 
@@ -173,14 +129,12 @@ async def startup() -> None:
     _embedder    = _build_embedder()
     _reranker    = Reranker(model_name=settings.reranker_model)
 
-    # ── Vector stores (hybrid manager) ────────────────────────────────────
     _local_store = _build_local_store(_embedder)
-    _cloud_store = _build_cloud_store(_embedder)   # None if no creds
+    _cloud_store = _build_cloud_store(_embedder)
 
     _bm25_store  = BM25Store(path=str(data_dir / "bm25.pkl"))
     _chain       = _build_chain()
 
-    # ── Network monitor ───────────────────────────────────────────────────
     from services.network_monitor import NetworkMonitor
     _network_monitor = NetworkMonitor(
         check_url     = settings.network_check_url,
@@ -200,10 +154,6 @@ async def startup() -> None:
 def _build_chain() -> RAGChain:
     llm = _build_llm()
 
-    # The retriever is initialised with the local store.
-    # At retrieval time, get_vector_store() is passed in dynamically
-    # (via the `store` param in HybridRetriever.retrieve()) so online/offline
-    # switching is transparent without rebuilding the chain.
     retriever = HybridRetriever(
         vector_store = _local_store,
         embedder     = _embedder,
@@ -225,22 +175,16 @@ def _build_chain() -> RAGChain:
 
 
 def get_chain() -> RAGChain:
-    """Return the shared RAGChain instance."""
     return _chain
 
 
 def rebuild_chain() -> None:
-    """
-    Rebuild the chain after a store switch or major config change.
-    Thread-safe — holds the lock during rebuild.
-    """
     global _chain
     with _lock:
         _chain = _build_chain()
 
 
 def clear_chain_memory() -> None:
-    """Clear conversation history on the shared chain."""
     with _lock:
         if _chain:
             _chain.reset_memory()
@@ -249,18 +193,67 @@ def clear_chain_memory() -> None:
 # ── NETWORK STATUS ────────────────────────────────────────────────────────────
 
 def is_online() -> bool:
-    """
-    Returns True if network connectivity is currently available.
-    Falls back to True if monitor not yet initialised (startup race).
-    """
     if _network_monitor is None:
         return True
     return _network_monitor.is_online
 
 
-# ── PER-FILE DELETION ─────────────────────────────────────────────────────────
+# ── FILE DELETION ─────────────────────────────────────────────────────────────
+
+def delete_file_from_cloud(filename: str) -> dict:
+    """
+    Delete a file's vectors from the CLOUD store only.
+
+    This is the correct deletion path when a cloud store is configured.
+
+    WHY cloud only:
+      Cloud is the authoritative store. Local is a cache that syncs from cloud.
+      If you delete locally, the next sync re-pulls the file from cloud
+      (because to_pull = cloud_ids - local_ids will include those points again).
+      The only way to permanently remove a file is to remove it from cloud first.
+      Local cleanup then happens automatically on the next sync run.
+
+    BM25 is cleaned up immediately because it is a local index and stale
+    entries would cause dead results in offline queries right now, not later.
+
+    Local vectors are intentionally left as-is until the next sync.
+    During that window, offline mode may still return chunks from the deleted
+    file — this is an acceptable trade-off vs the risk of a diverged state.
+
+    Preconditions (enforced by the router):
+      - is_online() is True
+      - get_cloud_store() is not None
+      - filename exists in cloud_store.list_sources()
+    """
+    # Step 1: Delete from cloud (authoritative)
+    vectors_deleted = _cloud_store.delete_by_source(filename)
+    print(
+        f"  [SERVICE] ✅ Deleted {vectors_deleted} vectors from cloud "
+        f"for '{filename}'"
+    )
+
+    # Step 2: Remove from BM25 immediately so queries stop returning stale results
+    bm25_deleted = _bm25_store.delete_by_source(filename)
+    print(f"  [SERVICE] Removed {bm25_deleted} BM25 entries for '{filename}'")
+
+    # Step 3: Update the live retriever's BM25 reference
+    with _lock:
+        if _chain and hasattr(_chain.retriever, "bm25"):
+            _chain.retriever.bm25 = _bm25_store
+
+    return {
+        "vectors_deleted": vectors_deleted,
+        "bm25_deleted"   : bm25_deleted,
+    }
+
 
 def delete_file_from_stores(filename: str) -> dict:
+    """
+    Delete from LOCAL store + BM25.
+
+    Kept for internal use: wipe endpoint, admin tools, pure-local deployments.
+    NOT used by the user-facing delete endpoint when cloud is configured.
+    """
     vectors_deleted = _local_store.delete_by_source(filename)
     bm25_deleted    = _bm25_store.delete_by_source(filename)
 
@@ -274,34 +267,28 @@ def delete_file_from_stores(filename: str) -> dict:
     }
 
 
-# ── BM25 REBUILD (called by sync engine after vector sync) ────────────────────
+# ── BM25 REBUILD ─────────────────────────────────────────────────────────────
 
 def rebuild_bm25_async() -> None:
     """
-    Rebuild the BM25 index from the current local vector store contents.
-
-    Called asynchronously by the sync engine after a vector pull so the
-    BM25 index stays in sync with the vector store without blocking reconnect.
-
-    Scrolls the local store for all chunk contents, rebuilds the BM25 store,
-    and hot-swaps it on the running retriever.
+    Rebuild BM25 from local store contents after a vector sync.
+    FIX: uses new_bm25.build() — index_chunks() is on HybridRetriever, not BM25Store.
     """
-    import threading
-
     def _rebuild():
         global _bm25_store
         try:
             print("  [BM25] Starting async BM25 rebuild from local store...")
-            # Scroll local store for content field only
-            all_ids   = _local_store.get_all_ids(with_payload_fields=["source"])
+            all_ids = _local_store.get_all_ids(with_payload_fields=["source"])
             if not all_ids:
                 print("  [BM25] Local store empty — skipping BM25 rebuild")
                 return
 
-            # We need full content for BM25 — fetch in batches
             all_points = _local_store.get_points_by_ids([p["id"] for p in all_ids])
             chunks = [
-                {"content": pt["payload"].get("content", ""), "source": pt["payload"].get("source", "")}
+                {
+                    "content": pt["payload"].get("content", ""),
+                    "source" : pt["payload"].get("source", ""),
+                }
                 for pt in all_points
                 if pt["payload"].get("content")
             ]
@@ -310,12 +297,10 @@ def rebuild_bm25_async() -> None:
                 print("  [BM25] No content found — skipping BM25 rebuild")
                 return
 
-            from pathlib import Path
-            data_dir  = Path(settings.qdrant_path).parent
-            new_bm25  = BM25Store(path=str(data_dir / "bm25.pkl"))
+            data_dir = Path(settings.qdrant_path).parent
+            new_bm25 = BM25Store(path=str(data_dir / "bm25.pkl"))
             new_bm25.build(chunks)
 
-            # Hot-swap
             with _lock:
                 _bm25_store = new_bm25
                 if _chain and hasattr(_chain.retriever, "bm25"):
@@ -347,11 +332,10 @@ def get_bm25_store() -> BM25Store:
     return _bm25_store
 
 def get_reranker() -> Reranker:
-    """Return the shared Reranker singleton. Used by Person B's offline chat path."""
     return _reranker
 
 def get_parent_store():
-    return None   # inline parents, no separate store
+    return None
 
 def get_embedder():
     return _embedder

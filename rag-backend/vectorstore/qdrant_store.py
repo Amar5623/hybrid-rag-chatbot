@@ -157,7 +157,9 @@ class QdrantVectorStore(BaseVectorStore):
 
     def _ensure_collection(self) -> None:
         existing = [c.name for c in self.client.get_collections().collections]
+        
         if self.collection not in existing:
+            # Create the collection
             self.client.create_collection(
                 collection_name = self.collection,
                 vectors_config  = VectorParams(
@@ -166,8 +168,40 @@ class QdrantVectorStore(BaseVectorStore):
                 ),
             )
             print(f"  [QDRANT] Created new collection: '{self.collection}'")
+
+            # ── THIS IS THE FIX ─────────────────────────────────────
+            self.client.create_payload_index(
+                collection_name = self.collection,
+                field_name      = "source",
+                field_schema    = "keyword",      # required for delete_by_source()
+            )
+            print(f"  [QDRANT] ✅ Created payload index on 'source'")
+
+            # Optional but highly recommended indexes
+            self.client.create_payload_index(
+                collection_name = self.collection,
+                field_name      = "page",
+                field_schema    = "integer",
+            )
+            self.client.create_payload_index(
+                collection_name = self.collection,
+                field_name      = "type",
+                field_schema    = "keyword",
+            )
+            print(f"  [QDRANT] ✅ Created payload indexes on 'page' and 'type'")
+
         else:
             print(f"  [QDRANT] Using existing collection: '{self.collection}'")
+            
+            # Make sure indexes exist even on old collections (safe to call again)
+            try:
+                self.client.create_payload_index(
+                    collection_name = self.collection,
+                    field_name      = "source",
+                    field_schema    = "keyword",
+                )
+            except Exception:
+                pass  # index already exists
 
     def reset(self) -> None:
         """Wipe and recreate the collection."""
