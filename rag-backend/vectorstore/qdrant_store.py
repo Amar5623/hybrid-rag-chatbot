@@ -21,6 +21,32 @@
 #
 #   4. make_chunk_dict() used in _payload_to_dict() to centralise the
 #      key mapping and ensure schema consistency across vendors.
+#
+# FIX — Cloud write timeout during ingest:
+#   PROBLEM:
+#     When uploading a large PDF to Qdrant Cloud, ingest crashes with:
+#       httpx.WriteTimeout: The write operation timed out
+#     Root cause 1: QdrantClient(url=...) uses httpx default timeout (~5s).
+#       Sending 100 vectors with large parent_content payloads over the
+#       internet easily exceeds this.
+#     Root cause 2: batch_size=100 sends too much data per HTTP request.
+#       Each point carries a full payload including parent_content (~1500 chars),
+#       bbox, section_path etc. 100 × ~3KB ≈ 300KB per request over a cloud
+#       connection — this is too large for the default timeout.
+#
+#   FIX:
+#     1. Cloud client: QdrantClient(url=..., api_key=..., timeout=60)
+#        60 seconds is generous — gives slow connections plenty of headroom.
+#        Local client keeps no explicit timeout (uses library default, fast path).
+#
+#     2. _upsert_batched(): self.mode-aware batch size.
+#        Cloud → batch_size=25   (smaller payload per request, fewer timeouts)
+#        Local → batch_size=100  (local socket, large batches are fine)
+#
+#     Together these eliminate the WriteTimeout for any realistic PDF size.
+#     The batch count increases (e.g. 512 vectors → 21 cloud batches vs 6 local)
+#     but each request is small and fast, which is more reliable than one
+#     large slow request that risks timing out mid-write.
 
 import os
 import sys
@@ -37,6 +63,25 @@ from qdrant_client.models import (
 from embeddings.embedder    import BaseEmbedder, EmbedderFactory
 from config                 import QDRANT_COLLECTION, EMBEDDING_DIM, settings
 from vectorstore.base       import BaseVectorStore, make_chunk_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH SIZE CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Local Qdrant: large batches are fine — data never leaves the machine.
+_LOCAL_UPSERT_BATCH  = 100
+
+# Cloud Qdrant: each point carries a large payload (parent_content ~1500 chars,
+# bbox, section_path, etc.). 100 × ~3KB ≈ 300KB per HTTP request over the
+# internet, which regularly hits httpx's default write timeout.
+# 25 points × ~3KB ≈ 75KB per request — well within timeout margins.
+_CLOUD_UPSERT_BATCH  = 25
+
+# HTTP timeout in seconds for cloud connections.
+# 60s is conservative; most batches complete in < 5s, but slow connections
+# or large payloads can be slow. Better to wait than to crash mid-ingest.
+_CLOUD_HTTP_TIMEOUT  = 60
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,11 +135,19 @@ class QdrantVectorStore(BaseVectorStore):
                     "to be set in .env or passed explicitly."
                 )
             print(f"\n  [QDRANT] Connecting to Qdrant Cloud at: {_url}")
-            self.client = QdrantClient(url=_url, api_key=_api_key)
-            self.path   = None
+            # FIX: timeout=60 prevents httpx.WriteTimeout on large PDF ingests.
+            # The default httpx timeout (~5s) is too short for cloud upserts
+            # with large payloads (parent_content + bbox metadata per point).
+            self.client = QdrantClient(
+                url     = _url,
+                api_key = _api_key,
+                timeout = _CLOUD_HTTP_TIMEOUT,
+            )
+            self.path = None
         else:
             _path = path or settings.qdrant_path
             print(f"\n  [QDRANT] Connecting to local DB at: {_path}")
+            # Local: no timeout needed — socket operations don't timeout on loopback
             self.client = QdrantClient(path=_path)
             self.path   = _path
 
@@ -182,12 +235,35 @@ class QdrantVectorStore(BaseVectorStore):
         self._upsert_batched(structs)
         print(f"  [QDRANT] ✅ Upserted {len(structs)} pre-computed points")
 
-    def _upsert_batched(self, points: list[PointStruct], batch_size: int = 100) -> None:
-        for i in range(0, len(points), batch_size):
+    def _upsert_batched(self, points: list[PointStruct]) -> None:
+        """
+        Upsert points in batches sized appropriately for local vs cloud.
+
+        FIX: batch_size is now mode-aware.
+          Cloud: 25 points per request — each point has a large payload
+                 (parent_content ~1500 chars + bbox + metadata ≈ 3KB).
+                 25 × 3KB = ~75KB per HTTP request — safe for cloud timeouts.
+          Local: 100 points per request — local socket, no network latency,
+                 large batches are fine and faster overall.
+
+        The `timeout` argument is NOT passed to client.upsert() here because
+        it is already set on the QdrantClient instance at construction time
+        (timeout=_CLOUD_HTTP_TIMEOUT for cloud). Per-call timeout overrides
+        are not needed.
+        """
+        batch_size = _CLOUD_UPSERT_BATCH if self.mode == "cloud" else _LOCAL_UPSERT_BATCH
+        total      = len(points)
+
+        for i in range(0, total, batch_size):
+            batch = points[i : i + batch_size]
             self.client.upsert(
                 collection_name = self.collection,
-                points          = points[i : i + batch_size],
+                points          = batch,
             )
+            # Progress log for large ingests so it's clear the upload is running
+            if total > batch_size:
+                end = min(i + batch_size, total)
+                print(f"  [QDRANT] Upserted {end}/{total} points...")
 
     def delete_by_source(self, filename: str) -> int:
         """
@@ -216,7 +292,6 @@ class QdrantVectorStore(BaseVectorStore):
         """
         if not ids:
             return 0
-        # Process in batches to avoid oversized requests
         batch_size = 200
         total_deleted = 0
         for i in range(0, len(ids), batch_size):

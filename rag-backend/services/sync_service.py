@@ -1,44 +1,44 @@
 # services/sync_service.py
 #
-# Person A — Phase 5 (Day 6-8)
+# CHANGES vs previous version (VectorPullSyncService rewrite):
 #
-# FULL REWRITE — replaces the original PDF-download-and-re-embed approach
-# with a vector-pull sync that copies points directly from the cloud store.
+# FIX — Sync now works WITHOUT SYNC_MANIFEST_URL.
 #
-# OLD approach (original SyncService):
-#   1. Fetch manifest JSON from central server
-#   2. Download PDFs that are new/changed
-#   3. Run the full ingest pipeline (chunk → embed → upsert)
-#   Problem: expensive, slow, requires internet for the full embedding run.
+#   OLD behaviour:
+#     The routers/sync.py trigger and network_monitor._on_reconnect both
+#     checked `if not settings.sync_manifest_url: return "skipped"`.
+#     This meant the entire sync was gated on a manifest URL that most
+#     deployments don't have — so the sync never ran even when Qdrant Cloud
+#     credentials were fully configured.
 #
-# NEW approach (VectorPullSyncService):
-#   STEP 1 — Vector sync
-#     a. Scroll cloud store → all point IDs + source + sha256 fields
-#     b. Scroll local store → same
-#     c. Diff: points in cloud but not local → fetch + upsert (no embed)
-#              points in local but not cloud → delete (admin removed a doc)
+#   NEW behaviour:
+#     SYNC_MANIFEST_URL is now OPTIONAL.  The sync is split into two
+#     independent steps:
 #
-#   STEP 2 — PDF sync
-#     For every source now in local store, check if the PDF exists in
-#     data/pdfs/. Download any missing ones from a manifest URL.
-#     (The manifest still provides download URLs — we just no longer use
-#     it to drive re-embedding.)
+#       STEP 1 — Vector sync (ALWAYS runs if cloud store is configured)
+#         Diffs cloud vs local Qdrant by point IDs.
+#         Pulls missing points from cloud into local — no re-embedding needed.
+#         Deletes local points that no longer exist in the cloud.
+#         This step requires: QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY
+#         (or LanceDB/Chroma cloud creds for other vendors).
+#         Does NOT require SYNC_MANIFEST_URL.
 #
-#   STEP 3 — BM25 rebuild
-#     Trigger rag_service.rebuild_bm25_async() after vector sync.
-#     Non-blocking — runs in a background thread so reconnect is instant.
+#       STEP 2 — PDF sync (ONLY runs if SYNC_MANIFEST_URL is set)
+#         Downloads missing PDF files from the manifest for the viewer.
+#         Skipped silently when SYNC_MANIFEST_URL is empty.
+#         Chat and retrieval work fine without PDFs — only the PDF viewer
+#         modal (frontend) is affected.
 #
-# PREREQUISITES:
-#   - The cloud Qdrant collection must have been populated by the same admin
-#     pipeline that uses the same payload schema as add_documents().
-#   - Cloud store creds must be set (QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY
-#     for Qdrant, or equivalent for LanceDB/Chroma).
-#   - SYNC_MANIFEST_URL must point to a JSON manifest with PDF download URLs.
-#     Format:  { "docs": [{"filename": "x.pdf", "sha256": "abc", "url": "https://..."}] }
+#       STEP 3 — BM25 rebuild (async, after any vector changes)
+#         Same as before.
+#
+#   SUMMARY:
+#     - Set QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY → vector sync works.
+#     - Set SYNC_MANIFEST_URL too → PDF files also download for the viewer.
+#     - Neither set → sync is skipped (cloud store not configured).
 #
 # BACKWARD COMPATIBILITY:
-#   The old SyncService is preserved as a class alias so existing imports
-#   don't break. Swap is silent.
+#   SyncService alias preserved. All import sites unchanged.
 
 import json
 import threading
@@ -60,24 +60,34 @@ class VectorPullSyncService:
     """
     Sync the local vector store from the cloud store without re-embedding.
 
-    Three-step process on each sync trigger:
-      1. Vector sync  — copy new/changed points from cloud to local
-      2. PDF sync     — download any missing PDF files
-      3. BM25 rebuild — rebuild sparse index from local store (async)
+    How it works:
+      1. Compare point IDs in the cloud store vs local store.
+      2. Pull any points that exist in cloud but not locally (no re-embedding).
+      3. Delete any local points that were removed from the cloud.
+      4. Optionally download missing PDFs (only if SYNC_MANIFEST_URL is set).
+      5. Rebuild the BM25 index asynchronously.
+
+    Requirements:
+      - Cloud vector store credentials (QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY
+        for Qdrant, or LANCEDB_CLOUD_URI / CHROMA_HOST for other vendors).
+      - SYNC_MANIFEST_URL is optional — only needed for PDF file downloads.
 
     Thread-safe: only one sync runs at a time.
     """
 
     def __init__(self):
         from config import settings
-        self.manifest_url = settings.sync_manifest_url
+        self.manifest_url = settings.sync_manifest_url   # may be empty — that's OK
         self.timeout      = 30   # seconds for HTTP requests
 
     # ── PUBLIC ────────────────────────────────────────────────────────────
 
     def run(self) -> dict:
         """
-        Main sync method. Thread-safe — only one sync runs at a time.
+        Main sync entry point. Thread-safe — only one sync runs at a time.
+
+        Vector sync runs whenever cloud store creds are configured.
+        PDF sync runs only when SYNC_MANIFEST_URL is also set.
 
         Returns:
             Status dict with keys: status, vectors_added, vectors_deleted,
@@ -133,11 +143,21 @@ class VectorPullSyncService:
         except Exception:
             pass
 
+        # Determine a human-readable status message
+        import services.rag_service as _svc
+        cloud_configured = _svc.get_cloud_store() is not None
+        if not cloud_configured:
+            message = "Cloud store not configured (set QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY)"
+        elif not self.manifest_url:
+            message = "Vector sync ready (SYNC_MANIFEST_URL not set — PDF download disabled)"
+        else:
+            message = "Sync service ready"
+
         return {
             "last_synced"  : last_synced,
             "is_syncing"   : is_syncing,
             "pending_count": pending_count,
-            "message"      : "Sync service ready" if self.manifest_url else "SYNC_MANIFEST_URL not configured",
+            "message"      : message,
         }
 
     # ── INTERNAL ──────────────────────────────────────────────────────────
@@ -152,12 +172,15 @@ class VectorPullSyncService:
         if cloud is None:
             return {
                 "status" : "skipped",
-                "message": "Cloud store not configured — no cloud creds set",
+                "message": (
+                    "Cloud store not configured — set QDRANT_CLOUD_URL + "
+                    "QDRANT_CLOUD_API_KEY (or equivalent for your vendor)"
+                ),
                 "vectors_added": 0, "vectors_deleted": 0,
                 "pdfs_downloaded": 0, "errors": [],
             }
 
-        # ── STEP 1: Vector sync ────────────────────────────────────────────
+        # ── STEP 1: Vector sync (always runs when cloud is configured) ─────
         vectors_added   = 0
         vectors_deleted = 0
 
@@ -168,14 +191,20 @@ class VectorPullSyncService:
             print(f"  [SYNC] ❌ {err}")
             errors.append(err)
 
-        # ── STEP 2: PDF sync ───────────────────────────────────────────────
+        # ── STEP 2: PDF sync (only when manifest URL is set) ───────────────
         pdfs_downloaded = 0
-        try:
-            pdfs_downloaded = self._sync_pdfs(local, errors)
-        except Exception as e:
-            err = f"PDF sync failed: {e}"
-            print(f"  [SYNC] ⚠  {err}")
-            errors.append(err)
+        if self.manifest_url:
+            try:
+                pdfs_downloaded = self._sync_pdfs(local, errors)
+            except Exception as e:
+                err = f"PDF sync failed: {e}"
+                print(f"  [SYNC] ⚠  {err}")
+                errors.append(err)
+        else:
+            print(
+                "  [SYNC] PDF sync skipped — "
+                "SYNC_MANIFEST_URL not set (vector sync completed normally)"
+            )
 
         # ── STEP 3: BM25 rebuild (async, non-blocking) ─────────────────────
         if vectors_added > 0 or vectors_deleted > 0:
@@ -184,7 +213,7 @@ class VectorPullSyncService:
             except Exception as e:
                 errors.append(f"BM25 rebuild trigger failed: {e}")
 
-        status = "error" if errors and vectors_added == 0 else "ok"
+        status = "error" if errors and vectors_added == 0 and vectors_deleted == 0 else "ok"
         return {
             "status"          : status,
             "vectors_added"   : vectors_added,
@@ -202,6 +231,13 @@ class VectorPullSyncService:
         """
         Diff cloud vs local by point IDs and sync the delta.
 
+        This is the core sync mechanism — no SYNC_MANIFEST_URL needed.
+        It works by:
+          1. Fetching all point IDs from both the cloud and local stores.
+          2. Computing the set difference.
+          3. Pulling missing points from cloud → local (with their vectors + payloads).
+          4. Deleting local points that no longer exist in the cloud.
+
         Returns (vectors_added, vectors_deleted).
         """
         print("  [SYNC] Diffing cloud vs local point IDs...")
@@ -213,15 +249,22 @@ class VectorPullSyncService:
         cloud_ids = {e["id"] for e in cloud_entries}
         local_ids = {e["id"] for e in local_entries}
 
-        to_pull   = list(cloud_ids - local_ids)   # in cloud but not local
-        to_delete = list(local_ids - cloud_ids)   # in local but not cloud (deleted upstream)
+        to_pull   = list(cloud_ids - local_ids)   # in cloud but not local → pull
+        to_delete = list(local_ids - cloud_ids)   # in local but not cloud → delete
 
-        print(f"  [SYNC] Cloud: {len(cloud_ids)} | Local: {len(local_ids)} | "
-              f"To pull: {len(to_pull)} | To delete: {len(to_delete)}")
+        print(
+            f"  [SYNC] Cloud: {len(cloud_ids)} pts | Local: {len(local_ids)} pts | "
+            f"To pull: {len(to_pull)} | To delete: {len(to_delete)}"
+        )
+
+        if len(to_pull) == 0 and len(to_delete) == 0:
+            print("  [SYNC] ✅ Local store is already in sync with cloud — nothing to do")
+            return 0, 0
 
         # ── Pull missing points from cloud ─────────────────────────────────
         vectors_added = 0
         if to_pull:
+            print(f"  [SYNC] Pulling {len(to_pull)} missing points from cloud...")
             batch_size = 100
             for i in range(0, len(to_pull), batch_size):
                 batch = to_pull[i : i + batch_size]
@@ -230,15 +273,19 @@ class VectorPullSyncService:
                     if points:
                         local.upsert_from_points(points)
                         vectors_added += len(points)
-                        print(f"  [SYNC] Pulled batch {i//batch_size + 1}: {len(points)} points")
+                        print(
+                            f"  [SYNC] Pulled batch {i // batch_size + 1}: "
+                            f"{len(points)} points"
+                        )
                 except Exception as e:
-                    err = f"Pull batch {i//batch_size + 1} failed: {e}"
+                    err = f"Pull batch {i // batch_size + 1} failed: {e}"
                     print(f"  [SYNC] ⚠  {err}")
                     errors.append(err)
 
-        # ── Delete removed points from local ────────────────────────────────
+        # ── Delete stale local points ───────────────────────────────────────
         vectors_deleted = 0
         if to_delete:
+            print(f"  [SYNC] Deleting {len(to_delete)} stale local points...")
             try:
                 vectors_deleted = local.delete_by_ids(to_delete)
             except Exception as e:
@@ -246,18 +293,25 @@ class VectorPullSyncService:
                 print(f"  [SYNC] ⚠  {err}")
                 errors.append(err)
 
+        if vectors_added > 0:
+            print(f"  [SYNC] ✅ Pulled {vectors_added} new vectors from cloud")
+        if vectors_deleted > 0:
+            print(f"  [SYNC] 🗑  Deleted {vectors_deleted} stale local vectors")
+
         return vectors_added, vectors_deleted
 
     def _sync_pdfs(self, local, errors: list[str]) -> int:
         """
         Download PDFs that exist in the local vector store but not on disk.
 
-        Uses the manifest URL for download links.
+        This step is OPTIONAL — only runs when SYNC_MANIFEST_URL is set.
+        The manifest provides download URLs for each source PDF.
+
+        Manifest format:
+            { "docs": [{"filename": "x.pdf", "sha256": "abc", "url": "https://..."}] }
+
         Returns number of PDFs downloaded.
         """
-        if not self.manifest_url:
-            return 0
-
         from config import PDFS_DIR
         pdfs_dir = Path(PDFS_DIR)
         pdfs_dir.mkdir(parents=True, exist_ok=True)
@@ -334,7 +388,7 @@ class VectorPullSyncService:
 
 # ── BACKWARD COMPATIBILITY ALIAS ─────────────────────────────────────────────
 # Old code that imports: from services.sync_service import SyncService
-# will get the new VectorPullSyncService transparently.
+# will get VectorPullSyncService transparently.
 SyncService = VectorPullSyncService
 
 __all__ = ["VectorPullSyncService", "SyncService"]

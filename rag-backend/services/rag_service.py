@@ -313,7 +313,7 @@ def rebuild_bm25_async() -> None:
             from pathlib import Path
             data_dir  = Path(settings.qdrant_path).parent
             new_bm25  = BM25Store(path=str(data_dir / "bm25.pkl"))
-            new_bm25.index_chunks(chunks)
+            new_bm25.build(chunks)
 
             # Hot-swap
             with _lock:
