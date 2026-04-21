@@ -68,6 +68,7 @@ CHUNK_KEYS: list[str] = [
     "bbox",
     "page_width",
     "page_height",
+    "source_url",
 ]
 
 # Default values when a payload field is absent (e.g. older indexed chunks).
@@ -87,6 +88,7 @@ CHUNK_DEFAULTS: dict = {
     "bbox"          : None,
     "page_width"    : None,
     "page_height"   : None,
+    "source_url": "",
 }
 
 

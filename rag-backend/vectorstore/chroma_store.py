@@ -108,6 +108,7 @@ def _chunk_to_chroma(chunk: dict, vector: list[float]) -> tuple[str, list[float]
         "bbox"          : json.dumps(bbox) if bbox is not None else "",
         "page_width"    : float(chunk.get("page_width")  or 0.0),
         "page_height"   : float(chunk.get("page_height") or 0.0),
+        "source_url"    : str(chunk.get("source_url",    "") or ""),
     }
 
     return point_id, [float(v) for v in vector], metadata, document
@@ -145,6 +146,7 @@ def _chroma_to_chunk(
         "bbox"          : bbox,
         "page_width"    : metadata.get("page_width")     or None,
         "page_height"   : metadata.get("page_height")    or None,
+        "source_url"    : metadata.get("source_url",     ""),
     }
     return make_chunk_dict(payload, score=score)
 
@@ -187,14 +189,32 @@ class ChromaVectorStore(BaseVectorStore):
 
         if mode == "cloud" or host:
             _host = host or settings.chroma_host
-            _port = port or settings.chroma_port
-            if not _host:
-                raise ValueError(
-                    "ChromaVectorStore(mode='cloud') requires CHROMA_HOST in .env"
+            if not _host or "trychroma.com" in _host:   # ← detects Chroma Cloud
+                print(f"\n  [CHROMA] Connecting to Chroma Cloud...")
+
+                # Use the official CloudClient (recommended for api.trychroma.com)
+                _tenant   = getattr(settings, "chroma_tenant",   "default_tenant")
+                _database = getattr(settings, "chroma_database", "default_database")
+                _api_key  = settings.chroma_api_key.strip() if hasattr(settings, "chroma_api_key") else ""
+
+                if not _api_key:
+                    raise ValueError("Chroma Cloud requires CHROMA_API_KEY in .env")
+
+                print(f"  [CHROMA] Tenant: {_tenant} | Database: {_database}")
+
+                self.client = chromadb.CloudClient(
+                    tenant   = _tenant,
+                    database = _database,
+                    api_key  = _api_key,
                 )
-            print(f"\n  [CHROMA] Connecting to remote Chroma at: {_host}:{_port}")
-            self.client = chromadb.HttpClient(host=_host, port=_port)
-            self.path   = None
+                self.path   = None
+                self.mode   = "cloud"
+            else:
+                # Self-hosted remote Chroma server (rarely used)
+                _port = port or settings.chroma_port
+                print(f"\n  [CHROMA] Connecting to remote self-hosted Chroma at: {_host}:{_port}")
+                self.client = chromadb.HttpClient(host=_host, port=_port)
+                self.path   = None
         else:
             _path = path or settings.chroma_path
             print(f"\n  [CHROMA] Connecting to local Chroma at: {_path}")
@@ -275,6 +295,7 @@ class ChromaVectorStore(BaseVectorStore):
                 "bbox"          : json.dumps(bbox) if bbox is not None else "",
                 "page_width"    : float(payload.get("page_width")  or 0.0),
                 "page_height"   : float(payload.get("page_height") or 0.0),
+                "source_url"    : str(payload.get("source_url",  "") or ""),
             }
             ids.append(p["id"])
             embeddings.append([float(v) for v in p["vector"]])
@@ -370,6 +391,7 @@ class ChromaVectorStore(BaseVectorStore):
                 "bbox"          : bbox,
                 "page_width"    : (meta or {}).get("page_width")     or None,
                 "page_height"   : (meta or {}).get("page_height")    or None,
+                "source_url"    : (meta or {}).get("source_url", ""),
             }
             output.append({
                 "id"     : doc_id,
@@ -450,6 +472,10 @@ class ChromaVectorStore(BaseVectorStore):
     def delete_collection(self) -> None:
         self.client.delete_collection(self.collection)
         print(f"  [CHROMA] Deleted collection: '{self.collection}'")
+
+    def reset_collection(self) -> None:
+        """Alias for reset() — matches QdrantVectorStore interface."""
+        self.reset()
 
     # ── DIAGNOSTICS ───────────────────────────────────────────────────────
 

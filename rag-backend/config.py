@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     chroma_path: str = str(BASE_DIR / "data" / "chroma")
     chroma_host: str = ""
     chroma_port: int = 8000
+    chroma_api_key: str = ""
 
     # ── Supabase Storage ──────────────────────────────────────────────────
     # Used to upload PDFs to a permanent public bucket during ingestion so
