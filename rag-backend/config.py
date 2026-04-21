@@ -1,25 +1,16 @@
 # config.py
 #
-# CHANGES — Day 1 joint commit (Person A + Person B):
+# CHANGES — Supabase Storage integration:
 #
-#   Person A adds:
-#     vector_store_vendor   : which backend to use (qdrant | lancedb | chroma)
-#     qdrant_cloud_url      : Qdrant Cloud REST endpoint
-#     qdrant_cloud_api_key  : Qdrant Cloud API key
-#     lancedb_uri           : local LanceDB path
-#     lancedb_cloud_uri     : LanceDB cloud URI (s3:// or lancedb://)
-#     lancedb_cloud_api_key : LanceDB cloud key
-#     lancedb_cloud_region  : LanceDB cloud region
-#     chroma_path           : local ChromaDB persist path
-#     chroma_host           : remote Chroma server host
-#     chroma_port           : remote Chroma server port
+#   Added:
+#     supabase_url        : Supabase project URL (e.g. https://xxx.supabase.co)
+#     supabase_service_key: service_role key (secret — never expose publicly)
+#     supabase_bucket     : bucket name (must be public, default "pdfs")
 #
-#   Person B adds:
-#     enable_offline_reranker : toggle offline reranker in chat router
-#     reranker_model          : cross-encoder model name
-#     reranker_top_k          : how many chunks to keep after offline rerank
-#     network_poll_interval   : how often NetworkMonitor checks connectivity
-#     network_check_timeout   : HTTP timeout for each connectivity check
+#   Backward compatible: if all three are empty, Supabase upload is skipped
+#   and the system behaves exactly as before (local-only mode).
+#
+# Everything else is UNCHANGED.
 
 from pydantic_settings import BaseSettings
 from pathlib import Path
@@ -65,9 +56,6 @@ class Settings(BaseSettings):
     offline_top_k: int = 5
 
     # ── Reranker (Person B settings) ──────────────────────────────────────
-    # When enable_offline_reranker=True, the chat router applies the
-    # cross-encoder in offline mode too (not just online mode).
-    # Set ENABLE_OFFLINE_RERANKER=true in .env to activate.
     enable_offline_reranker: bool = True
     reranker_model         : str  = "cross-encoder/ms-marco-TinyBERT-L-2-v2"
     reranker_top_k         : int  = 5
@@ -76,15 +64,10 @@ class Settings(BaseSettings):
     network_check_url: str = "https://8.8.8.8"
     sync_manifest_url: str = ""   # set to your central server manifest endpoint
 
-    # Person B: surface poll interval and timeout to config
-    # (were hardcoded 30s / 5s in rag_service.py and network_monitor.py)
     network_poll_interval : int = 15   # seconds between connectivity checks
     network_check_timeout : int = 3    # HTTP timeout for each check
 
     # ── Vector store vendor (Person A) ────────────────────────────────────
-    # Controls which backend all vector operations use.
-    # Change VECTOR_STORE_VENDOR in .env to switch the entire backend.
-    # Values: "qdrant" (default) | "lancedb" | "chroma"
     vector_store_vendor: str = "qdrant"
 
     # ── Qdrant (local mode — unchanged) ───────────────────────────────────
@@ -97,14 +80,33 @@ class Settings(BaseSettings):
 
     # ── LanceDB ───────────────────────────────────────────────────────────
     lancedb_uri          : str = str(BASE_DIR / "data" / "lancedb")
-    lancedb_cloud_uri    : str = ""   # s3:// or lancedb:// URI
+    lancedb_cloud_uri    : str = ""
     lancedb_cloud_api_key: str = ""
     lancedb_cloud_region : str = ""
 
     # ── ChromaDB ──────────────────────────────────────────────────────────
     chroma_path: str = str(BASE_DIR / "data" / "chroma")
-    chroma_host: str = ""        # remote Chroma server (leave empty for local)
+    chroma_host: str = ""
     chroma_port: int = 8000
+
+    # ── Supabase Storage ──────────────────────────────────────────────────
+    # Used to upload PDFs to a permanent public bucket during ingestion so
+    # that the sync engine can later download them on other devices.
+    #
+    # Leave all three empty to run in local-only mode (no upload, no change
+    # to existing behaviour).
+    #
+    # Setup:
+    #   1. Create a Supabase project at https://supabase.com
+    #   2. Go to Storage → create a bucket named "pdfs" and make it PUBLIC
+    #   3. Go to Project Settings → API → copy the service_role key (secret)
+    #   4. Set the three variables below in your .env file
+    #
+    # Public URL format produced after upload:
+    #   https://<project-ref>.supabase.co/storage/v1/object/public/pdfs/<filename>
+    supabase_url        : str = ""   # e.g. https://abcxyz.supabase.co
+    supabase_service_key: str = ""   # service_role secret key
+    supabase_bucket     : str = "pdfs"
 
     class Config:
         env_file          = ".env"
@@ -114,8 +116,6 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # ── Legacy constants (kept for backward compatibility) ────────────────────────
-# Existing routers and services reference these module-level names.
-# New code should use settings.* directly.
 QDRANT_PATH          = settings.qdrant_path
 QDRANT_COLLECTION    = settings.qdrant_collection
 EMBEDDING_DIM        = settings.embedding_dim

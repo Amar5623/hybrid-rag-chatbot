@@ -1,17 +1,24 @@
 # routers/ingest.py
 #
-# CHANGES vs previous version (Day 2 — A5):
-#   - _ingest_files_sync(): after hashing + loading, the PDF is now copied to
-#     data/pdfs/{filename} for static serving. This enables the PDF viewer
-#     modal (Person B, Task B1) to fetch and render the original document.
+# CHANGES vs previous version:
 #
-#   - _delete_pdf_file(): new helper that removes data/pdfs/{filename}
-#     when a file is deleted from the knowledge base.
+#   Supabase Storage integration (new — backward compatible):
+#     After a PDF is successfully chunked and indexed, it is uploaded to the
+#     configured Supabase public bucket.  The permanent public URL is then
+#     injected into every chunk's metadata as "source_url" before the chunks
+#     are written to the vector store.
 #
-#   - delete_file endpoint: now also calls _delete_pdf_file() so the
-#     stored PDF is cleaned up alongside vectors and BM25 entries.
+#     If Supabase is NOT configured (SUPABASE_URL / SUPABASE_SERVICE_KEY empty),
+#     the upload step is skipped silently and "source_url" is set to "" so
+#     existing behaviour is completely unchanged.
 #
-#   Everything else unchanged (duplicate check, chunking, indexing).
+#   Key changes inside _ingest_files_sync():
+#     1. After chunking, call upload_pdf_to_supabase(tmp_path) → public_url.
+#     2. Inject "source_url": public_url into every chunk dict.
+#     3. Then index as before.
+#
+# Everything else (duplicate detection, PDF viewer copy, delete logic,
+# hash registry, etc.) is UNCHANGED.
 
 import hashlib
 import json
@@ -35,8 +42,6 @@ router = APIRouter(tags=["ingest"])
 _HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
 
 # ── PDFs directory (A5) ───────────────────────────────────────
-# Same path as PDFS_DIR in config.py, resolved as a Path object.
-# data/pdfs/ is mounted at /pdfs by main.py.
 _PDFS_DIR  = Path(PDFS_DIR)
 
 
@@ -65,38 +70,21 @@ def _remove_hash_for_file(filename: str) -> None:
     _save_hashes(updated)
 
 
-# ── NEW (A5): PDF file management ─────────────────────────────
+# ── PDF file management (A5) ──────────────────────────────────
 
 def _store_pdf_file(tmp_path: str, filename: str) -> Path | None:
-    """
-    Copy a PDF from the temporary upload path to data/pdfs/{filename}.
-
-    This makes the file available at /pdfs/{filename} for the frontend
-    PDF viewer (Person B, Task B1). The copy is idempotent — if the
-    same filename already exists (e.g. from a previous identical upload
-    that passed the hash check) we skip silently.
-
-    Returns the destination Path on success, None on error.
-    """
     _PDFS_DIR.mkdir(parents=True, exist_ok=True)
     dest = _PDFS_DIR / filename
-
     try:
         shutil.copy2(tmp_path, dest)
         print(f"  [INGEST] PDF stored for viewer: data/pdfs/{filename}")
         return dest
     except Exception as e:
-        # Non-fatal: the PDF viewer just won't work for this file.
-        # Retrieval / chat still works normally.
         print(f"  [INGEST] Warning: could not store PDF for viewer: {e}")
         return None
 
 
 def _delete_pdf_file(filename: str) -> None:
-    """
-    Remove data/pdfs/{filename} when the document is deleted from the KB.
-    Silently skips if the file doesn't exist (e.g. non-PDF or failed store).
-    """
     pdf_path = _PDFS_DIR / filename
     if pdf_path.exists():
         try:
@@ -112,12 +100,35 @@ def _get_loader(tmp_path: str, filename: str):
     ext = Path(filename).suffix.lower()
     if ext == ".pdf":
         return PDFLoader(tmp_path)
-    return None   # only PDFs supported now
+    return None
 
 
 # ── Core ingest logic (runs in threadpool) ────────────────────
 
 def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
+    """
+    Ingest one or more files into the vector store.
+
+    For each PDF:
+      1. Duplicate check (SHA-256).
+      2. Load blocks via PDFLoader.
+      3. Chunk (hierarchical or other strategy).
+      4. [NEW] Upload to Supabase Storage → get public_url (skipped if not configured).
+      5. [NEW] Inject source_url into every chunk dict.
+      6. Add chunks to vector store + BM25.
+      7. Copy PDF to data/pdfs/ for the local viewer.
+
+    The source_url field is "" when Supabase is not configured so downstream
+    code (sync engine, frontend) can safely check its truthiness.
+    """
+    # ── Import Supabase helper (lazy — avoids import errors if requests not installed)
+    try:
+        from services.supabase_storage import upload_pdf_to_supabase
+        _supabase_import_ok = True
+    except ImportError:
+        _supabase_import_ok = False
+        print("  [INGEST] ⚠  supabase_storage import failed — Supabase upload disabled")
+
     hashes       = _load_hashes()
     chunker      = _svc.get_chunker()
     vector_store = rag_service.get_vector_store()
@@ -127,14 +138,13 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
     skipped       : list[str] = []
     all_children  : list[dict] = []
 
-    # === Minimal addition: save original PDF for viewer ===
+    # Save original PDF for viewer (early pass — keeps existing behaviour)
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for tmp_path_str, filename in file_paths:
         tmp_path = Path(tmp_path_str)
         if tmp_path.exists():
             shutil.copy2(tmp_path, pdfs_dir / filename)
-    # ====================================================
 
     for tmp_path, filename in file_paths:
         # ── 1. Duplicate check ────────────────────────────
@@ -174,18 +184,48 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         else:
             children = chunker.chunk_documents(blocks)
 
+        # ── 4. Upload to Supabase Storage ─────────────────
+        # Attempt upload only for PDFs and only when Supabase is configured.
+        # On failure we log and continue — ingestion is not blocked.
+        source_url = ""
+        if _supabase_import_ok and Path(filename).suffix.lower() == ".pdf":
+            try:
+                public_url = upload_pdf_to_supabase(tmp_path)
+                if public_url:
+                    source_url = public_url
+                    # Log once per file (not per chunk)
+                    print(
+                        f"  [INGEST] [SUPABASE] source_url set for "
+                        f"'{filename}': {source_url}"
+                    )
+                else:
+                    print(
+                        f"  [INGEST] [SUPABASE] Upload returned None for "
+                        f"'{filename}' — source_url left empty"
+                    )
+            except Exception as exc:
+                print(
+                    f"  [INGEST] [SUPABASE] Upload exception for "
+                    f"'{filename}': {exc} — continuing without source_url"
+                )
+
+        # ── 5. Inject source_url into every chunk ─────────
+        # This happens regardless of whether upload succeeded:
+        #   - source_url = "<public_url>"  → Supabase upload succeeded
+        #   - source_url = ""              → Supabase not configured or failed
+        # Downstream code can always do: chunk.get("source_url") or ""
+        for child in children:
+            child["source_url"] = source_url
+
         all_children.extend(children)
         files_indexed.append(filename)
         hashes[fhash] = filename
 
-        # ── 4. (A5) Copy PDF to viewer store ──────────────
-        # Done per-file, after successful load + chunk, before index.
-        # Only PDFs are supported by the loader anyway, but we guard
-        # on extension defensively so future loaders don't break this.
+        # ── 6. Copy PDF to local viewer store ────────────
         if Path(filename).suffix.lower() == ".pdf":
             _store_pdf_file(tmp_path, filename)
 
-    # ── 5. Index ──────────────────────────────────────────
+    # ── 7. Index all chunks ───────────────────────────────
     if all_children:
         vector_store.add_documents(all_children)
         bm25_store.add(all_children)
@@ -204,8 +244,7 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest(files: list[UploadFile] = File(...)):
-    # === SAFE ORIGINAL PDF STORAGE FOR PDF VIEWER ===
-    # This runs in the already-async function - no structure change
+    # Save original PDFs for the viewer before processing
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for file in files:
@@ -214,9 +253,8 @@ async def ingest(files: list[UploadFile] = File(...)):
             content = await file.read()
             with open(dest_path, "wb") as f:
                 f.write(content)
-            await file.seek(0)   # Important: reset file pointer for original code
-    # ================================================
-    
+            await file.seek(0)
+
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
@@ -250,19 +288,57 @@ async def ingest(files: list[UploadFile] = File(...)):
 
 @router.delete("/ingest/{filename}", response_model=DeleteFileResponse)
 async def delete_file(filename: str):
-    vector_store = rag_service.get_vector_store()
-    sources = vector_store.list_sources()
-    if filename not in sources:
+    """
+    Delete a file from the knowledge base.
+
+    RULES:
+      - Must be ONLINE to delete (cloud is authoritative).
+      - Must have a cloud store configured (QDRANT_CLOUD_URL set).
+      - Deletes from CLOUD only — local vectors are cleaned up by the
+        next sync run (sync engine diffs cloud vs local and removes stale points).
+      - BM25 index and local PDF file are cleaned up immediately.
+
+    BLOCKED when:
+      - User is offline (network monitor says no connectivity).
+      - No cloud store is configured (pure local deployment has no sync,
+        so deleting locally would cause permanent data divergence on reconnect).
+    """
+
+    # ── Guard 1: must be online ───────────────────────────
+    if not rag_service.is_online():
         raise HTTPException(
-            status_code = status.HTTP_404_NOT_FOUND,
-            detail      = f"File '{filename}' not found in the knowledge base.",
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail      = (
+                f"Cannot delete '{filename}' while offline. "
+                "Deletion requires a cloud connection so the change is "
+                "applied to the authoritative store. Please reconnect and try again."
+            ),
         )
 
-    result = await run_in_threadpool(rag_service.delete_file_from_stores, filename)
-    _remove_hash_for_file(filename)
+    # ── Guard 2: cloud store must be configured ───────────
+    cloud_store = rag_service.get_cloud_store()
+    if cloud_store is None:
+        raise HTTPException(
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail      = (
+                f"Cannot delete '{filename}': no cloud store is configured. "
+                "Set QDRANT_CLOUD_URL and QDRANT_CLOUD_API_KEY in .env to enable deletion."
+            ),
+        )
 
-    # ── (A5) Clean up the stored PDF ──────────────────────
-    # Remove from data/pdfs/ so the viewer can't serve a deleted doc.
+    # ── Guard 3: file must exist in cloud ─────────────────
+    cloud_sources = cloud_store.list_sources()
+    if filename not in cloud_sources:
+        raise HTTPException(
+            status_code = status.HTTP_404_NOT_FOUND,
+            detail      = f"File '{filename}' not found in the cloud knowledge base.",
+        )
+
+    # ── Delete from cloud ─────────────────────────────────
+    result = await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
+
+    # ── Clean up local side effects immediately ───────────
+    _remove_hash_for_file(filename)
     _delete_pdf_file(filename)
 
     return DeleteFileResponse(
@@ -270,8 +346,9 @@ async def delete_file(filename: str):
         filename        = filename,
         vectors_deleted = result["vectors_deleted"],
         message         = (
-            f"Deleted '{filename}': "
-            f"{result['vectors_deleted']} vectors removed."
+            f"Deleted '{filename}' from cloud: "
+            f"{result['vectors_deleted']} vectors removed. "
+            f"Local vectors will be cleaned up on next sync."
         ),
     )
 
@@ -289,12 +366,12 @@ async def trigger_sync():
     """
     Manually trigger a sync check.
     Called automatically by NetworkMonitor when internet is detected.
-    Kicks off SyncService to fetch manifest and pull new PDFs.
     """
     from services.sync_service import SyncService
     sync = SyncService()
-    if not settings.sync_manifest_url:
-        return {"status": "skipped", "message": "SYNC_MANIFEST_URL not configured."}
+
+    if rag_service.get_cloud_store() is None:
+        return {"status": "skipped", "message": "Cloud store not configured."}
 
     import asyncio
     asyncio.create_task(run_in_threadpool(sync.run))

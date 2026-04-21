@@ -1,10 +1,11 @@
 # services/network_monitor.py
 #
-# NEW FILE.
-# Single responsibility: poll a lightweight external URL every 30 seconds.
-# Expose is_online: bool.
-# When status transitions offline → online, emit an event that
-# triggers the sync service automatically.
+# CHANGES vs previous version:
+#   - _on_reconnect() no longer requires SYNC_MANIFEST_URL to be set.
+#     Sync now runs automatically on reconnect whenever cloud store creds
+#     are configured (QDRANT_CLOUD_URL + QDRANT_CLOUD_API_KEY).
+#     Previously, an empty SYNC_MANIFEST_URL silently prevented auto-sync
+#     on reconnect, so vectors would never sync unless triggered manually.
 
 import threading
 import time
@@ -18,7 +19,7 @@ class NetworkMonitor:
     Exposes is_online: bool — read by rag_service and the chat router.
 
     On offline → online transition, automatically calls SyncService.run()
-    if SYNC_MANIFEST_URL is configured.
+    if cloud store credentials are configured (SYNC_MANIFEST_URL is optional).
 
     Usage:
         monitor = NetworkMonitor(check_url="https://8.8.8.8", poll_interval=30)
@@ -104,13 +105,17 @@ class NetworkMonitor:
     def _on_reconnect(self) -> None:
         """
         Called when connectivity is restored.
-        Triggers the sync service if manifest URL is configured.
+        Triggers the sync service if cloud store credentials are configured.
+        SYNC_MANIFEST_URL is NOT required — vector sync works without it.
         Runs in the monitor thread — keep it fast and non-blocking.
         """
         try:
-            from config import settings
-            if not settings.sync_manifest_url:
+            import services.rag_service as rag_svc
+            # Only trigger sync if a cloud store was successfully configured at startup
+            if rag_svc.get_cloud_store() is None:
+                print("  [NETWORK] Cloud store not configured — skipping auto-sync")
                 return
+
             from services.sync_service import SyncService
             sync = SyncService()
             # Run sync in a separate thread so monitor loop isn't blocked
