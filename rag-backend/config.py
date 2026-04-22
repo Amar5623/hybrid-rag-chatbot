@@ -10,6 +10,12 @@
 #   Backward compatible: if all three are empty, Supabase upload is skipped
 #   and the system behaves exactly as before (local-only mode).
 #
+# CHANGES — Admin panel auth:
+#
+#   Added:
+#     admin_token: Bearer token required to access /admin/* routes.
+#                  Leave empty to disable auth (dev mode).
+#
 # Everything else is UNCHANGED.
 
 from pydantic_settings import BaseSettings
@@ -108,6 +114,18 @@ class Settings(BaseSettings):
     supabase_url        : str = ""   # e.g. https://abcxyz.supabase.co
     supabase_service_key: str = ""   # service_role secret key
     supabase_bucket     : str = "pdfs"
+
+    # ── Admin panel auth ──────────────────────────────────────────────────
+    # Bearer token required to access /admin/* routes.
+    # Leave empty to disable auth (dev mode — all admin routes are open).
+    # Set a strong random string in production.
+    #
+    # Example (generate a token):
+    #   python -c "import secrets; print(secrets.token_hex(32))"
+    #
+    # Usage — include in every admin request:
+    #   Authorization: Bearer <your-token>
+    admin_token: str = ""
 
     class Config:
         env_file          = ".env"

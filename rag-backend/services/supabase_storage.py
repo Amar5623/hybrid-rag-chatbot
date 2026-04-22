@@ -179,9 +179,62 @@ def download_pdf_from_url(url: str, dest_path: str) -> bool:
                 pass
         return False
 
+def delete_pdf_from_supabase(filename: str) -> bool:
+    """
+    Delete a PDF object from Supabase Storage.
+
+    Args:
+        filename: The filename as stored in the bucket (e.g. "manual.pdf").
+
+    Returns:
+        True  — object deleted successfully (or Supabase not configured).
+        False — delete failed (logged, but caller continues regardless).
+
+    Supabase Storage REST API:
+        DELETE /storage/v1/object/<bucket>/<filename>
+        Requires the same Authorization + apikey headers as upload.
+        Returns 200 on success.
+    """
+    if not supabase_enabled():
+        return True   # no-op — not configured
+
+    from config import settings
+    import requests
+
+    service_key = settings.supabase_service_key.strip()
+    base_url    = settings.supabase_url.rstrip("/")
+    bucket      = settings.supabase_bucket.strip()
+
+    delete_url = f"{base_url}/storage/v1/object/{bucket}/{filename}"
+
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "apikey"       : service_key,
+    }
+
+    try:
+        print(f"  [SUPABASE] Deleting '{filename}' from bucket '{bucket}'…")
+        response = requests.delete(delete_url, headers=headers, timeout=30)
+
+        if response.status_code in (200, 204):
+            print(f"  [SUPABASE] ✅ Deleted '{filename}' from Supabase Storage")
+            return True
+        else:
+            print(
+                f"  [SUPABASE] ❌ Delete failed for '{filename}': "
+                f"HTTP {response.status_code} — {response.text[:300]}"
+            )
+            return False
+
+    except Exception as exc:
+        print(f"  [SUPABASE] ❌ Delete exception for '{filename}': {exc}")
+        return False
+
 
 __all__ = [
     "supabase_enabled",
     "upload_pdf_to_supabase",
     "download_pdf_from_url",
+    "delete_pdf_from_supabase",
 ]
+
