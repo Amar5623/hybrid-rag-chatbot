@@ -225,6 +225,7 @@ def delete_file_from_cloud(filename: str) -> dict:
       - get_cloud_store() is not None
       - filename exists in cloud_store.list_sources()
     """
+    # AFTER
     # Step 1: Delete from cloud (authoritative)
     vectors_deleted = _cloud_store.delete_by_source(filename)
     print(
@@ -232,11 +233,20 @@ def delete_file_from_cloud(filename: str) -> dict:
         f"for '{filename}'"
     )
 
-    # Step 2: Remove from BM25 immediately so queries stop returning stale results
+    # Step 2: Delete from Supabase Storage (if configured)
+    # Run before BM25 cleanup so all remote state is cleared first.
+    # Failure is logged but does not block the rest of the delete flow.
+    try:
+        from services.supabase_storage import delete_pdf_from_supabase
+        delete_pdf_from_supabase(filename)
+    except Exception as _exc:
+        print(f"  [SERVICE] ⚠  Supabase delete skipped: {_exc}")
+
+    # Step 3: Remove from BM25 immediately so queries stop returning stale results
     bm25_deleted = _bm25_store.delete_by_source(filename)
     print(f"  [SERVICE] Removed {bm25_deleted} BM25 entries for '{filename}'")
 
-    # Step 3: Update the live retriever's BM25 reference
+    # Step 4: Update the live retriever's BM25 reference
     with _lock:
         if _chain and hasattr(_chain.retriever, "bm25"):
             _chain.retriever.bm25 = _bm25_store
