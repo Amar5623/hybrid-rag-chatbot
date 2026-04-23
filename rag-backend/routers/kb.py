@@ -25,6 +25,7 @@ from schemas import (
 from services    import rag_service
 from routers.ingest import _wipe_hashes
 from config      import settings
+from datetime import datetime, timezone
 
 router = APIRouter(tags=["kb"])
 
@@ -40,19 +41,21 @@ async def health():
     FORCE_OFFLINE_MODE=true in environment → always returns is_online=false.
     """
     force_offline = os.getenv("FORCE_OFFLINE_MODE", "false").strip().lower() == "true"
+    ts = datetime.now(timezone.utc).isoformat()
 
     if force_offline:
         return {
-            "status":          "ok",
-            "is_online":       False,
-            "groq_configured": bool(settings.groq_api_key),
-            "forced":          True,
+            "status":         "ok",
+            "is_online":      False,
+            "groq_available": bool(settings.groq_api_key),
+            "timestamp":      ts,
         }
 
     return HealthResponse(
         status          = "ok",
-        groq_configured = bool(settings.groq_api_key),
+        groq_available  = bool(settings.groq_api_key),
         is_online       = rag_service.is_online(),
+        timestamp       = ts,
     )
 
 
@@ -102,6 +105,10 @@ async def export_chunks():
             "parent_content": c.get("parent_content") or content,
             "page":           page,
             "chunk_type":     c.get("type", "text"),
+            # ── NEW: coordinate fields so mobile FTS3 results can open PDF at exact location ──
+            "bbox"        : c.get("bbox"),         # [x0, y0, x1, y1] or null
+            "page_width"  : c.get("page_width"),   # float or null
+            "page_height" : c.get("page_height"),  # float or null
         })
 
     return {

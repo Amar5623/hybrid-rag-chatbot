@@ -76,7 +76,13 @@ class Reranker:
             print("  [RERANKER] No chunks to rerank.")
             return RetrievalResult([])
 
-        pairs = [(query, c["content"]) for c in chunks]
+        # Use parent_content for reranking — it has full context vs the 512-char child.
+        # Reranking a fragment ("...as described above...") can incorrectly downrank
+        # chunks whose parent passage contains the actual answer.
+        pairs = [
+            (query, c.get("parent_content") or c["content"])
+            for c in chunks
+        ]
 
         scores = self.model.predict(
             pairs,

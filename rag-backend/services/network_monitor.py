@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
-
+import os
 
 class NetworkMonitor:
     """
@@ -58,6 +58,8 @@ class NetworkMonitor:
 
     def start(self) -> None:
         """Start the background polling thread."""
+        self._is_online = self._check()
+        self._last_checked = datetime.utcnow()
         self._thread = threading.Thread(
             target  = self._poll_loop,
             daemon  = True,   # dies when main process exits
@@ -95,7 +97,22 @@ class NetworkMonitor:
         """
         Try to reach check_url with a short timeout.
         Returns True if reachable, False otherwise.
+
+        IS_ONLINE_OVERRIDE (env var):
+          "true"  → always return True  (simulate online  — Mode 1)
+          "false" → always return False (simulate offline — Mode 2)
+          unset   → real network check (production behaviour)
+
+        This lets dev-start.sh run two instances on different ports where
+        one pretends to have internet and the other pretends it doesn't,
+        without actually changing the network.
         """
+        override = os.environ.get("IS_ONLINE_OVERRIDE", "").strip().lower()
+        if override == "true":
+            return True
+        if override == "false":
+            return False
+
         try:
             urllib.request.urlopen(self.check_url, timeout=self.timeout)
             return True

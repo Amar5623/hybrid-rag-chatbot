@@ -45,8 +45,8 @@ class Settings(BaseSettings):
     # ── Chunking ──────────────────────────────────────────────────────────
     chunk_size          : int = 500
     chunk_overlap       : int = 50
-    child_chunk_size    : int = 300
-    child_chunk_overlap : int = 30
+    child_chunk_size    : int = 512
+    child_chunk_overlap : int = 80
     parent_chunk_size   : int = 1500
     parent_chunk_overlap: int = 100
 
