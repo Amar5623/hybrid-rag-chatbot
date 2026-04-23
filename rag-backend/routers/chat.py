@@ -192,6 +192,11 @@ async def chat_stream(req: ChatRequest):
                                 "heading"     : c.get("heading", ""),
                                 "section_path": c.get("section_path", ""),
                                 "chunk_type"  : c.get("type", "text"),
+                                # ── NEW: bbox + source_url for clickable citations ──
+                                "bbox"        : c.get("bbox"),          # [x0,y0,x1,y1] or null
+                                "page_width"  : c.get("page_width"),    # float or null
+                                "page_height" : c.get("page_height"),   # float or null
+                                "source_url"  : c.get("source_url", ""),# Supabase URL or ""
                             }
                             for c in chunk.get_citations()
                         ]

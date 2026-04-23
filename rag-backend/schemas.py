@@ -43,6 +43,11 @@ class Citation(BaseModel):
     heading     : str        = ""
     section_path: str        = ""
     chunk_type  : str        = "text"
+    # ── NEW fields (Issue 1 — clickable citations) ──────
+    bbox        : list[float] | None  = None   # [x0, y0, x1, y1] PDF points, null if unavailable
+    page_width  : float | None        = None   # PDF page dimensions for coordinate normalisation
+    page_height : float | None        = None
+    source_url  : str                 = ""     # Supabase public URL or ""
 
 
 class ChatResponse(BaseModel):
@@ -133,9 +138,10 @@ class StatsResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status          : str
-    version         : str  = "3.0.0"
-    groq_configured : bool
-    is_online       : bool = True
+    version         : str        = "3.0.0"
+    groq_available  : bool                    # renamed from groq_configured
+    is_online       : bool       = True
+    timestamp       : str        = ""         # ISO UTC, filled by the endpoint
 
 
 class DocumentsResponse(BaseModel):
