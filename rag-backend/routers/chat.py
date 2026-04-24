@@ -75,25 +75,28 @@ def _run_offline_retrieval(question: str, chain, active_store) -> list:
         store        = active_store,
     )
 
+    # AFTER
     if settings.enable_offline_reranker:
-        # Apply cross-encoder reranker: rescores all candidates → keeps top reranker_top_k
-        reranker     = rag_service.get_reranker()
-        reranked     = reranker.rerank(
+        reranker = rag_service.get_reranker()
+        reranked = reranker.rerank(
             query     = question,
             retrieval = retrieval,
             top_k     = settings.reranker_top_k,
         )
-        final_chunks = reranked.get_chunks()
+        # expand_to_parents() replaces content with parent_content and
+        # deduplicates by parent_id — unique parents only, order preserved
+        expanded     = retriever.expand_to_parents(reranked)
+        final_chunks = expanded.get_chunks()
         print(
             f"  [CHAT/OFFLINE] Reranker ON — "
-            f"{len(retrieval)} candidates → {len(final_chunks)} reranked chunks"
+            f"{len(retrieval)} candidates → {len(reranked)} reranked → "
+            f"{len(final_chunks)} unique parent chunks"
         )
     else:
-        # No reranker: just slice to offline_top_k
         final_chunks = retrieval.get_chunks()[:settings.offline_top_k]
         print(
             f"  [CHAT/OFFLINE] Reranker OFF — "
-            f"returning top {len(final_chunks)} chunks from MMR"
+            f"returning top {len(final_chunks)} MMR child chunks (no parent expansion)"
         )
 
     # Log chunk ordering for comparison (toggle ENABLE_OFFLINE_RERANKER to see the difference)
