@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     reranker_model         : str  = "cross-encoder/ms-marco-TinyBERT-L-2-v2"
     reranker_top_k         : int  = 5
 
+    # RERANK #2 — parents kept after second rerank (post-expansion)
+    # Must be <= reranker_top_k.  Default: same as reranker_top_k (no extra cut).
+    parent_rerank_top_k    : int  = 5
+
     # ── Network / sync ────────────────────────────────────────────────────
     network_check_url: str = "https://8.8.8.8"
     sync_manifest_url: str = ""   # set to your central server manifest endpoint

@@ -78,20 +78,28 @@ def _run_offline_retrieval(question: str, chain, active_store) -> list:
     # AFTER
     if settings.enable_offline_reranker:
         reranker = rag_service.get_reranker()
+
+        # RERANK #1 — score child chunks (300-tok, precise fragments)
         reranked = reranker.rerank(
             query     = question,
             retrieval = retrieval,
-            top_k     = settings.reranker_top_k,
+            top_k     = settings.reranker_top_k,          # e.g. 20 → 10
         )
-        # expand_to_parents() replaces content with parent_content and
-        # deduplicates by parent_id — unique parents only, order preserved
-        expanded     = retriever.expand_to_parents(reranked)
-        final_chunks = expanded.get_chunks()
-        print(
-            f"  [CHAT/OFFLINE] Reranker ON — "
-            f"{len(retrieval)} candidates → {len(reranked)} reranked → "
-            f"{len(final_chunks)} unique parent chunks"
+        print(f"  [CHAT/OFFLINE] Rerank #1 done — {len(reranked)} children kept")
+
+        # EXPAND — replace child content with full parent passage (1500-tok)
+        expanded = retriever.expand_to_parents(reranked)
+        print(f"  [CHAT/OFFLINE] Expanded to {len(expanded)} parent passages")
+
+        # RERANK #2 — score parent passages (1500-tok, full context)
+        # The cross-encoder now sees the complete passage, not a fragment.
+        reranked2    = reranker.rerank(
+            query     = question,
+            retrieval = expanded,
+            top_k     = settings.parent_rerank_top_k,     # e.g. 10 → 5
         )
+        final_chunks = reranked2.get_chunks()
+        print(f"  [CHAT/OFFLINE] Rerank #2 done — {len(final_chunks)} parent chunks kept")
     else:
         final_chunks = retrieval.get_chunks()[:settings.offline_top_k]
         print(

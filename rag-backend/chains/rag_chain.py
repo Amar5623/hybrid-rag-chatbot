@@ -228,6 +228,7 @@ class RAGChain:
         self.use_reranker = use_reranker
         self.reranker     = reranker or (Reranker() if use_reranker else None)
         self.rerank_top_k = rerank_top_k
+        self.parent_rerank_top_k = settings.parent_rerank_top_k
 
         # ── Settings ──────────────────────────────────────
         self.retrieve_top_k  = retrieve_top_k
@@ -290,21 +291,35 @@ class RAGChain:
             print(f"  [RAG CHAIN] Offline — returning {len(retrieval)} child chunks")
             return retrieval
  
-        # ── ONLINE: rerank children first (A4) ────────────────────────────
+        # ── ONLINE RERANK #1: rerank children (precise, 300-tok fragments) ─
         if self.use_reranker and self.reranker and len(retrieval) > 0:
-            print(f"  [RAG CHAIN] Reranking {len(retrieval)} children...")
+            print(f"  [RAG CHAIN] Rerank #1 — scoring {len(retrieval)} children...")
             retrieval = self.reranker.rerank(
                 query     = question,
                 retrieval = retrieval,
-                top_k     = self.rerank_top_k,
+                top_k     = self.rerank_top_k,        # e.g. 20 → 10
             )
- 
-        # ── Expand top-N children to parent passages ───────────────────────
+            print(f"  [RAG CHAIN] Rerank #1 done — {len(retrieval)} children kept")
+
+        # ── Expand top-N reranked children to parent passages ─────────────
         if hasattr(self.retriever, "expand_to_parents"):
             retrieval = self.retriever.expand_to_parents(retrieval)
+            print(f"  [RAG CHAIN] Expanded to {len(retrieval)} parent passages")
         else:
             print("  [RAG CHAIN] expand_to_parents not available — skipping")
- 
+
+        # ── ONLINE RERANK #2: rerank parents (full context, 1500-tok) ─────
+        # Cross-encoder now scores the FULL parent passage against the query,
+        # not the small child fragment. This is the definitive relevance signal.
+        if self.use_reranker and self.reranker and len(retrieval) > 0:
+            print(f"  [RAG CHAIN] Rerank #2 — scoring {len(retrieval)} parent passages...")
+            retrieval = self.reranker.rerank(
+                query     = question,
+                retrieval = retrieval,
+                top_k     = self.parent_rerank_top_k, # e.g. 10 → 5
+            )
+            print(f"  [RAG CHAIN] Rerank #2 done — {len(retrieval)} parents kept for LLM")
+
         return retrieval
 
     # ── PROMPT BUILDING ───────────────────────────────────
