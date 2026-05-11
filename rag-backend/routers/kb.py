@@ -157,6 +157,20 @@ async def export_chunks(
             "embedding":      embedding,
         })
 
+
+    # Deduplicate chunks by id to prevent sending duplicate vector entries
+    seen_ids = set()
+    deduped = []
+    for chunk in chunks:
+        cid = chunk["id"]
+        if cid not in seen_ids:
+            seen_ids.add(cid)
+            deduped.append(chunk)
+    chunks = deduped
+
+    # Update matched count to reflect the deduplicated page
+    matched = sum(1 for c in chunks if c.get("embedding") is not None)
+
     logger.info(
         "[KB/EXPORT] page ready offset=%d  size=%d  total=%d  "
         "has_more=%s  vectors=%d  %.0f ms",
