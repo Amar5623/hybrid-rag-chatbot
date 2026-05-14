@@ -2,7 +2,7 @@
 #
 # Phase 3 — Plan & Usage Enforcement
 #
-# CHANGES vs Phase 1 version:
+# CHANGES vs Phase 2 version:
 #
 #   1. Quota warning response middleware (NEW):
 #      After every response, checks request.state.quota_warning.
@@ -19,11 +19,27 @@
 #   3. tasks/ package init (NEW):
 #      Creates tasks/__init__.py so the tasks module is importable.
 #
-# ALL OTHER CODE IS UNCHANGED.
+# ALL OTHER CODE IS UNCHANGED FROM PHASE 2.
 #
 # REQUIREMENTS ADDITION:
 #   apscheduler>=3.10.0
 #   (Add to requirements.txt)
+#
+# PREVIOUS PHASE 2 CHANGES RETAINED:
+#   - Registered `auth_router` (routers/auth.py) — handles all auth flows:
+#       POST /auth/admin/signup
+#       POST /auth/admin/login
+#       POST /auth/mobile/signup
+#       POST /auth/mobile/login
+#       POST /auth/refresh
+#
+# All previous changes are retained:
+#   - CORS allow_origins=["*"] for mobile LAN clients
+#   - Admin router under /admin prefix
+#   - Static files for /images and /pdfs
+#   - Periodic Cloud→Local sync background task
+#   - Request-ID logging middleware
+#
 
 import sys
 import os
@@ -46,9 +62,11 @@ from services              import rag_service
 from routers               import chat, ingest, kb
 from routers               import sync  as sync_router
 from routers               import admin as admin_router
+from routers               import auth  as auth_router   # Phase 2
 
 # ── Logging bootstrap ─────────────────────────────────────────────────────────
 from utils.logger import configure_logging, get_logger, set_request_id, clear_request_id
+
 logger = get_logger(__name__)
 
 # ── P5: Periodic Cloud→Local sync interval ────────────────────────────────────
@@ -87,8 +105,7 @@ async def _periodic_cloud_sync():
 
             if cloud_store is not None and is_online:
                 logger.info(
-                    "[PERIODIC SYNC] Conditions met (cloud_store=configured, "
-                    "is_online=True) — starting Cloud→Local vector sync"
+                    "[PERIODIC SYNC] Conditions met — starting Cloud→Local vector sync"
                 )
                 loop = asyncio.get_event_loop()
                 sync = SyncService()
@@ -187,6 +204,7 @@ async def lifespan(app: FastAPI):
         await sync_task
     except asyncio.CancelledError:
         pass
+    logger.info("[SHUTDOWN] ✅ Periodic sync task stopped")
 
     if scheduler is not None:
         logger.info("[SHUTDOWN] Shutting down reconciliation scheduler...")
@@ -197,7 +215,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title   = "RAG Chatbot API",
-    version = "3.2.0",   # bumped for Phase 3
+    version = "3.2.0",   # Phase 3 version
     lifespan= lifespan,
 )
 
@@ -291,8 +309,15 @@ pdfs_dir = Path(__file__).parent / "data" / "pdfs"
 pdfs_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/pdfs", StaticFiles(directory=str(pdfs_dir)), name="pdfs")
 
+
 # ── Routers ───────────────────────────────────────────────────────────────────
+# Phase 2 — Auth router (no JWT required — this IS the auth entry point)
+app.include_router(auth_router.router)
+
+# Admin router — all write operations under /admin/* (requires JWT admin role)
 app.include_router(admin_router.router)
+
+# Existing routers — kept for backward compatibility
 app.include_router(chat.router)
 app.include_router(ingest.router)
 app.include_router(kb.router)

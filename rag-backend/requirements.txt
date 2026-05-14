@@ -137,3 +137,5 @@ websockets==16.0
 xxhash==3.6.0
 zipp==3.23.1
 zstandard==0.25.0
+# GoTrue (Supabase auth sub-library, pulled in by supabase, listed for clarity)
+gotrue>=2.4.0
