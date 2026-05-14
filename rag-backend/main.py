@@ -1,25 +1,22 @@
 # rag-backend/main.py
 #
-# CHANGES FROM PREVIOUS VERSION:
-#   P5 — Added _periodic_cloud_sync() background task (Cloud→Local Qdrant sync)
-#        Runs every 20 minutes while server has internet. Skipped gracefully
-#        when cloud store is not configured or server is offline.
+# Phase 2 — Authentication System
 #
-# ORIGINAL CHANGES (kept):
+# CHANGES vs previous version:
+#   - Registered `auth_router` (routers/auth.py) — handles all auth flows:
+#       POST /auth/admin/signup
+#       POST /auth/admin/login
+#       POST /auth/mobile/signup
+#       POST /auth/mobile/login
+#       POST /auth/refresh
+#
+# All previous changes are retained:
 #   - CORS allow_origins=["*"] for mobile LAN clients
 #   - Admin router under /admin prefix
 #   - Static files for /images and /pdfs
+#   - Periodic Cloud→Local sync background task
+#   - Request-ID logging middleware
 #
-# LOGGING CHANGES:
-#   - configure_logging() called FIRST in lifespan so every module that
-#     imports after startup gets a properly configured logger.
-#   - Every major lifecycle event (startup, sync trigger, shutdown) is logged
-#     at INFO.  Errors are logged at ERROR with exc_info so the stack trace
-#     appears in the log file.
-#   - A FastAPI middleware logs every incoming request + response status code
-#     and wall-clock latency so you can trace a question from HTTP entry to
-#     response — including request-ID injection into the ContextVar used by
-#     utils.logger so ALL log lines for one request share the same req-id.
 
 import sys
 import os
@@ -42,15 +39,11 @@ from services              import rag_service
 from routers               import chat, ingest, kb
 from routers               import sync  as sync_router
 from routers               import admin as admin_router
+from routers               import auth  as auth_router   # Phase 2 — NEW
 
 # ── Logging bootstrap ─────────────────────────────────────────────────────────
-# Import FIRST — before any other module that might create loggers.
 from utils.logger import configure_logging, get_logger, set_request_id, clear_request_id
 
-# configure_logging() is called inside lifespan (after startup) so the log
-# directory (data/logs/) is guaranteed to exist by the time we try to open it.
-# get_logger() calls before configure_logging() still work — they just write to
-# the unconfigured root logger (no output), which is fine for module-level code.
 logger = get_logger(__name__)
 
 # ── P5: Periodic Cloud→Local sync interval ────────────────────────────────────
@@ -68,7 +61,6 @@ async def _periodic_cloud_sync():
     Skipped silently otherwise (e.g. at-sea with local-only Qdrant).
     The 30s initial delay lets the lifespan startup() finish before the first sync.
     """
-    # Log that the background task has started its initial sleep
     logger.info(
         "[PERIODIC SYNC] Task started — waiting 30 s for startup to complete "
         "before first sync attempt"
@@ -77,7 +69,6 @@ async def _periodic_cloud_sync():
 
     while True:
         try:
-            # Check whether cloud store is configured and we have internet
             cloud_store = (
                 rag_service.get_cloud_store()
                 if hasattr(rag_service, "get_cloud_store")
@@ -90,17 +81,14 @@ async def _periodic_cloud_sync():
             )
 
             if cloud_store is not None and is_online:
-                # Both conditions met — run the sync
                 logger.info(
-                    "[PERIODIC SYNC] Conditions met (cloud_store=configured, "
-                    "is_online=True) — starting Cloud→Local vector sync"
+                    "[PERIODIC SYNC] Conditions met — starting Cloud→Local vector sync"
                 )
                 loop = asyncio.get_event_loop()
                 sync = SyncService()
                 await loop.run_in_executor(None, sync.run)
                 logger.info("[PERIODIC SYNC] ✅ Sync complete")
             else:
-                # Log why we skipped so operators can diagnose missing syncs
                 skip_reason = (
                     "cloud store not configured"
                     if cloud_store is None
@@ -113,12 +101,11 @@ async def _periodic_cloud_sync():
                 )
 
         except Exception as e:
-            # Never let a sync error crash the background loop
             logger.error(
                 "[PERIODIC SYNC] ❌ Error (will retry in %d min): %s",
                 BACKEND_SYNC_INTERVAL_S // 60,
                 e,
-                exc_info=True,   # include full traceback in log file
+                exc_info=True,
             )
 
         logger.debug(
@@ -158,20 +145,18 @@ async def lifespan(app: FastAPI):
     try:
         await task
     except asyncio.CancelledError:
-        pass   # expected — task was cancelled cleanly
+        pass
     logger.info("[SHUTDOWN] ✅ Periodic sync task stopped")
     logger.info("[SHUTDOWN] RAG Chatbot API shut down cleanly")
 
 
 app = FastAPI(
     title   = "RAG Chatbot API",
-    version = "3.1.0",
+    version = "4.0.0",   # bumped for Phase 2
     lifespan= lifespan,
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# allow_origins=["*"] — permits mobile clients on any LAN IP.
-# allow_credentials must be False when using wildcard origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -182,16 +167,10 @@ app.add_middleware(
 
 
 # ── Request logging middleware ────────────────────────────────────────────────
-# Logs every incoming HTTP request with method, path, and a unique request-ID.
-# Logs the response status code and wall-clock latency once the response is sent.
-# Injects the request-ID into the logging ContextVar so ALL log lines emitted
-# during this request (across all modules) carry the same req=<id> tag.
-
 _mw_logger = get_logger("middleware.request")
 
 @app.middleware("http")
 async def _log_requests(request: Request, call_next):
-    # Generate a short unique ID for this request so logs can be correlated
     rid = _uuid.uuid4().hex[:12]
     set_request_id(rid)
 
@@ -217,7 +196,6 @@ async def _log_requests(request: Request, call_next):
         )
         raise
     finally:
-        # Always clear the request-ID when the request is done
         clear_request_id()
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -240,11 +218,16 @@ pdfs_dir = Path(__file__).parent / "data" / "pdfs"
 pdfs_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/pdfs", StaticFiles(directory=str(pdfs_dir)), name="pdfs")
 
+
 # ── Routers ───────────────────────────────────────────────────────────────────
-# Admin router — all write operations under /admin/* (requires ADMIN_TOKEN).
+
+# Phase 2 — Auth router (no JWT required — this IS the auth entry point)
+app.include_router(auth_router.router)
+
+# Admin router — all write operations under /admin/* (requires JWT admin role)
 app.include_router(admin_router.router)
 
-# Existing routers — kept for backward compatibility.
+# Existing routers — kept for backward compatibility
 app.include_router(chat.router)
 app.include_router(ingest.router)
 app.include_router(kb.router)

@@ -134,3 +134,12 @@ xxhash==3.6.0
 zipp==3.23.1
 zstandard==0.25.0
 nltk==3.9.1
+
+
+# ── Phase 2 additions ─────────────────────────────────────────────────────────
+# Supabase Python client — used for Auth (signup/login) and DB (tenants, members)
+supabase>=2.3.0
+# GoTrue (Supabase auth sub-library, pulled in by supabase, listed for clarity)
+gotrue>=2.4.0
+# PyJWT — used by middleware/tenant_resolver.py to decode Supabase JWTs
+PyJWT>=2.8.0

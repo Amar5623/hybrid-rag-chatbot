@@ -1,4 +1,20 @@
 # rag-backend/routers/ingest.py
+#
+# Phase 2 — Authentication System
+#
+# CHANGES vs previous version:
+#   - POST   /ingest             — now requires JWT auth (resolve_tenant + require_admin_role)
+#   - DELETE /ingest/{filename}  — now requires JWT auth (resolve_tenant + require_admin_role)
+#   - _ingest_files_sync()       — now accepts optional tenant_slug parameter.
+#     When provided, uses get_tenant_stores(tenant_slug) instead of global singletons.
+#     Backward compatible: tenant_slug=None → falls back to global stores (dev mode).
+#   - Supabase upload path scoped per-tenant: pdfs/{tenant_slug}/{filename}
+#
+# Read-only routes (GET /ingest/status, POST /ingest/sync) remain open —
+# they carry no write risk and are used by the sync engine.
+#
+# All existing ingest logic (hash dedup, chunking, BM25, vector store) is UNCHANGED.
+# Only the stores passed in and the auth gate change.
 
 import hashlib
 import json
@@ -7,23 +23,33 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 
-from config import settings, PDFS_DIR
-from services import rag_service as _svc
+from config        import settings, PDFS_DIR
+from services      import rag_service as _svc
+from services      import rag_service
 from ingestion.pdf_loader import PDFLoader
-from schemas import DeleteFileResponse, IngestResponse, IngestStatusResponse
-from services import rag_service
+from schemas       import DeleteFileResponse, IngestResponse, IngestStatusResponse
+from utils.logger  import get_logger
 
-# NO import from routers.kb here — use local imports inside functions instead
+# Phase 2 — JWT auth dependencies
+from middleware.tenant_resolver import resolve_tenant, require_admin_role
+from services.rag_service       import get_tenant_stores
+
+# NOTE: kb.py caches are imported locally inside functions to avoid circular deps
+
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["ingest"])
 
-# ── Hash registry ─────────────────────────────────────────────
+
+# ── Hash registry ─────────────────────────────────────────────────────────────
+
 _HASH_FILE = Path(settings.qdrant_path).parent / "file_hashes.json"
 
-# ── PDFs directory ────────────────────────────────────────────
+# ── PDFs directory ────────────────────────────────────────────────────────────
+
 _PDFS_DIR = Path(PDFS_DIR)
 
 
@@ -52,7 +78,7 @@ def _remove_hash_for_file(filename: str) -> None:
     _save_hashes(updated)
 
 
-# ── PDF file management ───────────────────────────────────────
+# ── PDF file management ───────────────────────────────────────────────────────
 
 def _store_pdf_file(tmp_path: str, filename: str) -> Path | None:
     _PDFS_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,7 +102,7 @@ def _delete_pdf_file(filename: str) -> None:
             print(f"  [INGEST] Warning: could not delete PDF from viewer store: {e}")
 
 
-# ── Loader dispatch ───────────────────────────────────────────
+# ── Loader dispatch ───────────────────────────────────────────────────────────
 
 def _get_loader(tmp_path: str, filename: str):
     ext = Path(filename).suffix.lower()
@@ -85,19 +111,27 @@ def _get_loader(tmp_path: str, filename: str):
     return None
 
 
-# ── Core ingest logic (runs in threadpool) ────────────────────
+# ── Core ingest logic (runs in threadpool) ────────────────────────────────────
 
-def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
+def _ingest_files_sync(
+    file_paths  : list[tuple[str, str]],
+    tenant_slug : str = None,           # Phase 2 — thread tenant scope through ingest
+) -> dict:
     """
-    Ingest one or more files into the vector store.
+    Ingest one or more files into the vector store and BM25 index.
+
+    Phase 2 change:
+      When tenant_slug is provided, uses get_tenant_stores(tenant_slug) to get
+      the tenant-scoped vector store and BM25 index. This ensures documents are
+      stored in the correct per-tenant Qdrant collection (rag_docs_{tenant_slug})
+      and the correct per-tenant BM25 file (bm25_{tenant_slug}.pkl).
+
+      When tenant_slug is None (legacy / single-tenant dev mode), falls back to
+      the global singletons from rag_service — backward compatible.
 
     For each PDF:
-      1. [FIX] Remove existing vectors/BM25 chunks for this filename BEFORE
-         the duplicate hash check. This ensures re-uploading the same filename
-         always produces a fresh index — even if the bytes are identical to the
-         previously stored version.
-      2. Duplicate check (SHA-256) — now only guards against the same file
-         appearing TWICE in the SAME upload batch, not across sessions.
+      1. Remove existing vectors/BM25 chunks for this filename (overwrite support).
+      2. Duplicate check (SHA-256) — guards against same file twice in one batch.
       3. Load blocks via PDFLoader.
       4. Chunk (hierarchical or other strategy).
       5. [Supabase] Upload to Supabase Storage → get public_url (skipped if not configured).
@@ -112,10 +146,19 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         _supabase_import_ok = False
         print("  [INGEST] ⚠  supabase_storage import failed — Supabase upload disabled")
 
+    # ── Resolve stores: tenant-scoped or global fallback ─────────────────────
+    if tenant_slug:
+        vector_store, bm25_store = get_tenant_stores(tenant_slug)
+        logger.info(
+            "[INGEST] Using tenant-scoped stores — slug=%s", tenant_slug
+        )
+    else:
+        vector_store = rag_service.get_vector_store()
+        bm25_store   = rag_service.get_bm25_store()
+        logger.info("[INGEST] Using global stores (single-tenant / dev mode)")
+
     hashes       = _load_hashes()
     chunker      = _svc.get_chunker()
-    vector_store = rag_service.get_vector_store()
-    bm25_store   = rag_service.get_bm25_store()
 
     files_indexed : list[str] = []
     skipped       : list[str] = []
@@ -129,50 +172,33 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         if tmp_path.exists():
             shutil.copy2(tmp_path, pdfs_dir / filename)
 
-    # Track sha256s seen in THIS batch only — prevents same file twice in one upload
+    # Track sha256s seen in THIS batch only
     batch_hashes: set[str] = set()
 
     for tmp_path, filename in file_paths:
 
-        # ── FIX 1: Remove existing data for this filename BEFORE the hash check
-        # ─────────────────────────────────────────────────────────────────────
-        # If this filename was previously indexed, wipe it from all stores first.
-        # This ensures an admin re-uploading the same filename always gets a
-        # fresh index — regardless of whether the bytes changed.
-        #
-        # This is safe because:
-        #   a) We immediately re-index it below if the content is valid.
-        #   b) The admin explicitly uploaded it, so they want it indexed.
-        #   c) The worst case (upload fails after wipe) leaves the KB without
-        #      this file — the same state as a manual delete, and no worse than
-        #      before this fix where the old data silently persisted.
-        #
+        # ── 1. Remove existing data for this filename before hash check ───────
         existing_sources = vector_store.list_sources()
         if filename in existing_sources:
-            print(f"  [INGEST] Overwrite detected for '{filename}' — removing old vectors and BM25 entries")
+            print(f"  [INGEST] Overwrite detected for '{filename}' — removing old data")
             vector_store.delete_by_source(filename)
             bm25_store.delete_by_source(filename)
             _remove_hash_for_file(filename)
-            # Reload hashes after removal so the check below uses the clean state
             hashes = _load_hashes()
             print(f"  [INGEST] Old data cleared for '{filename}' — re-indexing fresh")
 
-        # ── 2. Duplicate check (within THIS batch only after fix above)
-        # ─────────────────────────────────────────────────────────────────────
+        # ── 2. Duplicate check (within THIS batch only) ───────────────────────
         raw   = Path(tmp_path).read_bytes()
         fhash = hashlib.sha256(raw).hexdigest()
 
         if fhash in batch_hashes:
-            # Same file uploaded twice in the SAME batch — this is the only
-            # case we now skip. Cross-session duplicates are handled by the
-            # overwrite logic above.
             print(f"  [INGEST] Skipping duplicate in batch: {filename}")
             skipped.append(filename)
             continue
 
         batch_hashes.add(fhash)
 
-        # ── 3. Load ───────────────────────────────────────
+        # ── 3. Load ───────────────────────────────────────────────────────────
         loader = _get_loader(tmp_path, filename)
         if not loader:
             print(f"  [INGEST] Unsupported file type: {filename}")
@@ -193,27 +219,31 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         for b in blocks:
             b["source"] = filename
 
-        # ── 4. Chunk ──────────────────────────────────────
+        # ── 4. Chunk ──────────────────────────────────────────────────────────
         from ingestion.chunker import HierarchicalChunker
         if isinstance(chunker, HierarchicalChunker):
             children = chunker.chunk_hierarchical(blocks)
         else:
             children = chunker.chunk_documents(blocks)
 
-        # ── 5. Upload to Supabase Storage ─────────────────
+        # ── 5. Upload to Supabase Storage (tenant-scoped path) ────────────────
         source_url = ""
         if _supabase_import_ok and Path(filename).suffix.lower() == ".pdf":
             try:
-                public_url = upload_pdf_to_supabase(tmp_path)
+                # Phase 2: Pass tenant_slug so upload path is pdfs/{slug}/{filename}
+                public_url = upload_pdf_to_supabase(
+                    tmp_path,
+                    tenant_slug=tenant_slug or "",
+                )
                 if public_url:
                     source_url = public_url
-                    print(f"  [INGEST] [SUPABASE] source_url set for '{filename}': {source_url}")
+                    print(f"  [INGEST] [SUPABASE] source_url set: {source_url}")
                 else:
-                    print(f"  [INGEST] [SUPABASE] Upload returned None for '{filename}' — source_url left empty")
+                    print(f"  [INGEST] [SUPABASE] Upload returned None — source_url left empty")
             except Exception as exc:
-                print(f"  [INGEST] [SUPABASE] Upload exception for '{filename}': {exc} — continuing without source_url")
+                print(f"  [INGEST] [SUPABASE] Upload exception: {exc} — continuing")
 
-        # ── 6. Inject source_url into every chunk ─────────
+        # ── 6. Inject source_url into every chunk ─────────────────────────────
         for child in children:
             child["source_url"] = source_url
 
@@ -221,16 +251,24 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
         files_indexed.append(filename)
         hashes[fhash] = filename
 
-        # ── 7. Copy PDF to local viewer store ─────────────
+        # ── 7. Copy PDF to local viewer store ─────────────────────────────────
         if Path(filename).suffix.lower() == ".pdf":
             _store_pdf_file(tmp_path, filename)
 
-    # ── 8. Index all new chunks ───────────────────────────
+    # ── 8. Index all new chunks ───────────────────────────────────────────────
     if all_children:
         vector_store.add_documents(all_children)
         bm25_store.add(all_children)
 
     _save_hashes(hashes)
+
+    logger.info(
+        "[INGEST] Complete — tenant=%s  indexed=%s  chunks=%d  skipped=%s",
+        tenant_slug or "(global)",
+        files_indexed,
+        len(all_children),
+        skipped,
+    )
 
     return {
         "files_indexed": files_indexed,
@@ -240,26 +278,39 @@ def _ingest_files_sync(file_paths: list[tuple[str, str]]) -> dict:
     }
 
 
-# ── Endpoints ─────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/ingest", response_model=IngestResponse)
-async def ingest(files: list[UploadFile] = File(...)):
+@router.post(
+    "/ingest",
+    response_model = IngestResponse,
+    dependencies   = [Depends(resolve_tenant), Depends(require_admin_role)],
+)
+async def ingest(request: Request, files: list[UploadFile] = File(...)):
+    """
+    Upload and index one or more PDFs into the knowledge base.
+
+    Phase 2: Requires a valid admin JWT (Authorization: Bearer <access_token>).
+    Documents are stored in the tenant-scoped vector collection and BM25 index.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    tenant_slug = request.state.tenant_slug
+
+    # Save PDFs for the viewer
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for file in files:
         if file.filename.lower().endswith(".pdf"):
             dest_path = pdfs_dir / file.filename
-            content = await file.read()
+            content   = await file.read()
             with open(dest_path, "wb") as f:
                 f.write(content)
             await file.seek(0)
 
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided.")
-
     tmp_dir    = Path("/tmp") / f"rag_ingest_{uuid.uuid4().hex}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    file_paths: list[tuple[str, str]] = []
+    file_paths : list[tuple[str, str]] = []
 
     try:
         for upload in files:
@@ -268,15 +319,20 @@ async def ingest(files: list[UploadFile] = File(...)):
             tmp_path.write_bytes(content)
             file_paths.append((str(tmp_path), upload.filename))
 
-        result = await run_in_threadpool(_ingest_files_sync, file_paths)
+        result = await run_in_threadpool(
+            _ingest_files_sync, file_paths, tenant_slug
+        )
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Local import — avoids circular dependency with kb.py
-    from routers.kb import _vec_cache, _source_hash_cache
-    _vec_cache.clear()
-    _source_hash_cache.clear()
+    # Invalidate kb.py vector/source caches so next export sees fresh data
+    try:
+        from routers.kb import _vec_cache, _source_hash_cache
+        _vec_cache.clear()
+        _source_hash_cache.clear()
+    except Exception:
+        pass
 
     return IngestResponse(
         status        = "ok",
@@ -290,31 +346,32 @@ async def ingest(files: list[UploadFile] = File(...)):
     )
 
 
-@router.delete("/ingest/{filename}", response_model=DeleteFileResponse)
-async def delete_file(filename: str):
+@router.delete(
+    "/ingest/{filename}",
+    response_model = DeleteFileResponse,
+    dependencies   = [Depends(resolve_tenant), Depends(require_admin_role)],
+)
+async def delete_file(request: Request, filename: str):
     """
     Delete a file from the knowledge base.
+
+    Phase 2: Requires a valid admin JWT.
 
     RULES:
       - Must be ONLINE to delete (cloud is authoritative).
       - Must have a cloud store configured (QDRANT_CLOUD_URL set).
-      - Deletes from CLOUD only — local vectors are cleaned up by the
-        next sync run (sync engine diffs cloud vs local and removes stale points).
-      - BM25 index and local PDF file are cleaned up immediately.
-
-    BLOCKED when:
-      - User is offline (network monitor says no connectivity).
-      - No cloud store is configured (pure local deployment has no sync,
-        so deleting locally would cause permanent data divergence on reconnect).
+      - Deletes from the tenant's vector store + BM25 immediately.
+      - Also cleans up from global cloud store if present.
     """
+    tenant_slug = request.state.tenant_slug
+    vs, bm25    = get_tenant_stores(tenant_slug)
 
     if not rag_service.is_online():
         raise HTTPException(
             status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
             detail      = (
                 f"Cannot delete '{filename}' while offline. "
-                "Deletion requires a cloud connection so the change is "
-                "applied to the authoritative store. Please reconnect and try again."
+                "Deletion requires a cloud connection. Please reconnect and try again."
             ),
         )
 
@@ -324,41 +381,62 @@ async def delete_file(filename: str):
             status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
             detail      = (
                 f"Cannot delete '{filename}': no cloud store is configured. "
-                "Set QDRANT_CLOUD_URL and QDRANT_CLOUD_API_KEY in .env to enable deletion."
+                "Set QDRANT_CLOUD_URL and QDRANT_CLOUD_API_KEY in .env."
             ),
         )
 
-    cloud_sources = cloud_store.list_sources()
-    if filename not in cloud_sources:
+    # Check existence in the tenant's store
+    tenant_sources = vs.list_sources()
+    if filename not in tenant_sources:
         raise HTTPException(
             status_code = status.HTTP_404_NOT_FOUND,
-            detail      = f"File '{filename}' not found in the cloud knowledge base.",
+            detail      = f"File '{filename}' not found in the knowledge base.",
         )
 
-    result = await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
+    # Delete from tenant vector store
+    vectors_deleted = await run_in_threadpool(vs.delete_by_source, filename)
+
+    # Clean up tenant BM25 immediately
+    bm25.delete_by_source(filename)
+
+    # Best-effort cloud store cleanup
+    try:
+        cloud_sources = cloud_store.list_sources()
+        if filename in cloud_sources:
+            await run_in_threadpool(rag_service.delete_file_from_cloud, filename)
+    except Exception as exc:
+        logger.warning("[INGEST/DELETE] Cloud cleanup skipped: %s", exc)
 
     _remove_hash_for_file(filename)
     _delete_pdf_file(filename)
 
-    # Local import — avoids circular dependency with kb.py
-    from routers.kb import _vec_cache, _source_hash_cache
-    _vec_cache.clear()
-    _source_hash_cache.clear()
+    # Invalidate kb.py caches
+    try:
+        from routers.kb import _vec_cache, _source_hash_cache
+        _vec_cache.clear()
+        _source_hash_cache.clear()
+    except Exception:
+        pass
+
+    logger.info(
+        "[INGEST/DELETE] ✅ tenant=%s  file=%s  vectors_deleted=%d",
+        tenant_slug, filename, vectors_deleted,
+    )
 
     return DeleteFileResponse(
         status          = "ok",
         filename        = filename,
-        vectors_deleted = result["vectors_deleted"],
+        vectors_deleted = vectors_deleted,
         message         = (
-            f"Deleted '{filename}' from cloud: "
-            f"{result['vectors_deleted']} vectors removed. "
-            f"Local vectors will be cleaned up on next sync."
+            f"Deleted '{filename}': {vectors_deleted} vectors removed. "
+            "Local vectors will be cleaned up on next sync."
         ),
     )
 
 
 @router.get("/ingest/status/{task_id}", response_model=IngestStatusResponse)
 async def ingest_status(task_id: str):
+    """Return status of an async ingest task by ID."""
     task = rag_service.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -370,6 +448,9 @@ async def trigger_sync():
     """
     Manually trigger a sync check.
     Called automatically by NetworkMonitor when internet is detected.
+
+    Note: This route intentionally does NOT require auth — it is called by
+    internal services (network monitor, mobile app reconnect logic).
     """
     from services.sync_service import SyncService
     sync = SyncService()
@@ -380,3 +461,7 @@ async def trigger_sync():
     import asyncio
     asyncio.create_task(run_in_threadpool(sync.run))
     return {"status": "triggered", "message": "Sync started in background."}
+
+
+__all__ = ["router", "_ingest_files_sync", "_store_pdf_file", "_delete_pdf_file",
+           "_remove_hash_for_file", "_wipe_hashes"]
