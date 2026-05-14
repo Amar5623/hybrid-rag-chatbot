@@ -1,45 +1,24 @@
 # rag-backend/main.py
 #
-# Phase 3 — Plan & Usage Enforcement
+# Phase 5 — Super Admin Portal API
 #
-# CHANGES vs Phase 2 version:
+# CHANGES vs Phase 3 version:
 #
-#   1. Quota warning response middleware (NEW):
-#      After every response, checks request.state.quota_warning.
-#      If True, appends "X-Quota-Warning: over_quota" header to the response.
-#      The mobile app reads this header and shows a dismissible banner:
-#        "Your organization is over its plan limit.
-#         New documents cannot be added. Contact your admin to upgrade."
+#   1. Super Admin router registered (NEW):
+#      Imports `routers.super_admin` and registers it under /super-admin.
+#      All routes are protected by `require_super_admin` (Phase 5 middleware)
+#      which enforces JWT role="super_admin" + optional IP allowlist.
 #
-#   2. Nightly reconciliation APScheduler job (NEW):
-#      Schedules reconcile_all_tenants() to run at midnight every day.
-#      Uses APScheduler's AsyncIOScheduler (pip install apscheduler).
-#      The scheduler is started after startup() and shut down on shutdown.
+#   2. Version bumped to 5.0.0.
 #
-#   3. tasks/ package init (NEW):
-#      Creates tasks/__init__.py so the tasks module is importable.
-#
-# ALL OTHER CODE IS UNCHANGED FROM PHASE 2.
-#
-# REQUIREMENTS ADDITION:
-#   apscheduler>=3.10.0
-#   (Add to requirements.txt)
+# PREVIOUS PHASE 3 CHANGES RETAINED:
+#   - Quota warning response middleware (X-Quota-Warning header)
+#   - APScheduler nightly reconciliation job
 #
 # PREVIOUS PHASE 2 CHANGES RETAINED:
-#   - Registered `auth_router` (routers/auth.py) — handles all auth flows:
-#       POST /auth/admin/signup
-#       POST /auth/admin/login
-#       POST /auth/mobile/signup
-#       POST /auth/mobile/login
-#       POST /auth/refresh
+#   - Auth router (routers/auth.py) — POST /auth/* endpoints
 #
-# All previous changes are retained:
-#   - CORS allow_origins=["*"] for mobile LAN clients
-#   - Admin router under /admin prefix
-#   - Static files for /images and /pdfs
-#   - Periodic Cloud→Local sync background task
-#   - Request-ID logging middleware
-#
+# ALL OTHER CODE IS UNCHANGED FROM EARLIER PHASES.
 
 import sys
 import os
@@ -60,16 +39,17 @@ from services.sync_service import SyncService
 from services.rag_service  import startup
 from services              import rag_service
 from routers               import chat, ingest, kb
-from routers               import sync  as sync_router
-from routers               import admin as admin_router
-from routers               import auth  as auth_router   # Phase 2
+from routers               import sync        as sync_router
+from routers               import admin       as admin_router
+from routers               import auth        as auth_router        # Phase 2
+from routers               import super_admin as super_admin_router  # Phase 5
 
 # ── Logging bootstrap ─────────────────────────────────────────────────────────
 from utils.logger import configure_logging, get_logger, set_request_id, clear_request_id
 
 logger = get_logger(__name__)
 
-# ── P5: Periodic Cloud→Local sync interval ────────────────────────────────────
+# ── Periodic Cloud→Local sync interval ───────────────────────────────────────
 BACKEND_SYNC_INTERVAL_S = 20 * 60  # 20 minutes
 
 
@@ -215,7 +195,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title   = "RAG Chatbot API",
-    version = "3.2.0",   # Phase 3 version
+    version = "5.0.0",   # Phase 5 version
     lifespan= lifespan,
 )
 
@@ -316,6 +296,9 @@ app.include_router(auth_router.router)
 
 # Admin router — all write operations under /admin/* (requires JWT admin role)
 app.include_router(admin_router.router)
+
+# Phase 5 — Super admin portal under /super-admin/* (requires super_admin role + IP check)
+app.include_router(super_admin_router.router)
 
 # Existing routers — kept for backward compatibility
 app.include_router(chat.router)
