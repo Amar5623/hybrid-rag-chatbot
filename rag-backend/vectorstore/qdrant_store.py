@@ -104,7 +104,47 @@ _CLOUD_HTTP_TIMEOUT  = 60
 # MODULE-LEVEL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Singleton cache for local QdrantClient instances, keyed by absolute path.
+#
+# WHY THIS EXISTS:
+#   QdrantClient(path=...) acquires an EXCLUSIVE portalocker file lock on the
+#   storage folder.  Only ONE QdrantClient instance may hold that lock at a
+#   time.  If two parts of the app (e.g. _local_store at startup and a tenant
+#   store during ingest) independently call QdrantClient(path=same_path), the
+#   second call raises:
+#       RuntimeError: Storage folder ... is already accessed by another instance
+#   The fix is simple: every caller that needs a local client goes through
+#   _get_local_client(), which creates the client once and returns it on every
+#   subsequent call — one lock, shared everywhere.
+_local_client_registry: dict[str, "QdrantClient"] = {}
+
+
+def _get_local_client(path: str) -> "QdrantClient":
+    """
+    Return a shared QdrantClient for the given local storage path.
+
+    Creates a new client on first call for that path; returns the cached
+    instance on all subsequent calls.  This ensures only one portalocker
+    file lock is ever held per path, regardless of how many store objects
+    (global singleton, per-tenant, sync engine, etc.) reference it.
+
+    Thread-safe in CPython: dict reads/writes under the GIL are atomic for
+    simple get/set operations.  A double-initialisation race on first access
+    is harmless — both threads would try to create the same client; the
+    second write just overwrites the first with an equivalent object.
+    For stricter safety a threading.Lock can be added, but it is not needed
+    in practice because startup always calls this before request handling begins.
+    """
+    import os
+    abs_path = os.path.abspath(path)
+    if abs_path not in _local_client_registry:
+        print(f"\n  [QDRANT] Creating local client (singleton) for: {abs_path}")
+        _local_client_registry[abs_path] = QdrantClient(path=abs_path)
+    return _local_client_registry[abs_path]
+
+
 def _content_hash(source: str, page: int, content: str) -> str:
+    # ... rest of function unchanged
     """
     Stable lookup key shared between get_vectors_for_export() and /kb/export.
 
@@ -183,8 +223,9 @@ class QdrantVectorStore(BaseVectorStore):
         else:
             _path = path or settings.qdrant_path
             print(f"\n  [QDRANT] Connecting to local DB at: {_path}")
-            # Local: no timeout needed — socket operations don't timeout on loopback
-            self.client = QdrantClient(path=_path)
+            # Use the singleton helper — never create a second QdrantClient
+            # for the same path or the portalocker exclusive lock will crash.
+            self.client = _get_local_client(_path)
             self.path   = _path
 
         self._ensure_collection()

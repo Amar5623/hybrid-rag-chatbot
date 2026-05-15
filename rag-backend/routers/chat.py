@@ -250,7 +250,7 @@ async def chat_stream(request: Request, req: ChatRequest):
             return JSONResponse(content=result.model_dump())
 
         # Import active store so offline path uses local store (same as chain)
-        active_store = rag_service.get_local_store()
+        active_store = vs   # already fetched as tenant store at the top of this function
         logger.info(
             "[CHAT] OFFLINE — using local store (%s)  count=%d",
             type(active_store).__name__,
@@ -397,10 +397,11 @@ async def chat_offline(request: Request, req: ChatRequest):
     The retrieval + reranker logic is identical to the offline branch inside
     /chat/stream — both share the same _run_offline_retrieval() helper above.
     """
-    has_kb       = active_store.count() > 0
-    slug         = request.state.tenant_slug
+    # FIXED — resolve stores first, then check
+    slug                = request.state.tenant_slug
     active_store, _bm25 = get_tenant_stores(slug)
-    chain        = rag_service.get_chain()
+    chain               = rag_service.get_chain()
+    has_kb              = active_store.count() > 0
 
     logger.info(
         "[CHAT/OFFLINE] /chat/offline (Mode 2) — has_kb=%s  store=%s(%d)  question_len=%d",
