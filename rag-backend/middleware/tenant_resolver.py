@@ -169,6 +169,32 @@ async def resolve_tenant(request: Request) -> None:
     # yet — tell them to sign in again so a fresh JWT is issued.
     # ─────────────────────────────────────────────────────────────────────────
     if not tenant_id:
+        # Edge Function not deployed yet — fall back to DB lookup by user_id (sub claim).
+        # This lets dev/testing work without the custom claims hook running.
+        # Remove this fallback once the Supabase Edge Function is deployed and confirmed.
+        user_sub = payload.get("sub")
+        if user_sub:
+            try:
+                from services.supabase_client import get_supabase_admin
+                _sb = get_supabase_admin()
+                _member = (
+                    _sb.table("tenant_members")
+                    .select("tenant_id, role")
+                    .eq("user_id", user_sub)
+                    .single()
+                    .execute()
+                )
+                if _member.data:
+                    tenant_id = _member.data["tenant_id"]
+                    role      = _member.data.get("role", "user")
+                    logger.info(
+                        "[TENANT_RESOLVER] DB fallback used for user=%s → tenant=%s",
+                        user_sub, tenant_id,
+                    )
+            except Exception as _fb_exc:
+                logger.warning("[TENANT_RESOLVER] DB fallback failed: %s", _fb_exc)
+
+    if not tenant_id:
         raise HTTPException(
             status_code=401,
             detail="Token has no tenant context. Please sign in again.",

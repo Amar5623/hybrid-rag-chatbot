@@ -6,22 +6,24 @@ export default defineConfig({
   server: {
     port: 5174,
     proxy: {
-      // Proxy all /admin/* calls directly to FastAPI backend
       '/admin': {
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
-      // Proxy /pdfs/* for PDF preview
+      '/auth': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
       '/pdfs': {
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
-      '/api': {                          // keep if other /api/* routes exist
+      '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
         secure: false,
       },
-      '/sync': {                         // ← add this
+      '/sync': {
         target: 'http://localhost:8000',
         changeOrigin: true,
       },

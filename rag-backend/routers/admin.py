@@ -504,6 +504,8 @@ async def admin_usage(request: Request):
         "status"       : tenant.get("status"),
         "plan"         : plan.get("name"),
         "plan_id"      : plan.get("id"),
+        "display_name" : request.state.tenant.get("display_name", ""),
+        "slug"         : request.state.tenant_slug,
         "trial_ends_at": tenant.get("trial_ends_at"),
         "last_ingestion": last_ingestion,
     }
@@ -517,14 +519,24 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
     Upload and index one or more PDFs into the knowledge base.
     Admin only — requires a valid admin JWT.
 
-    Documents are stored in the tenant-scoped vector collection and BM25 index.
+    Post-flight (after _ingest_files_sync succeeds):
+      - Increments tenant_usage.vector_count by actual chunk count.
+      - Inserts one row into the documents table per successfully indexed file.
+    Both mirror the accounting done in POST /ingest (ingest.py).
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
+    tenant_id   = request.state.tenant_id
     tenant_slug = request.state.tenant_slug
 
-    # Save original PDFs for the viewer before processing
+    # ── Capture file sizes NOW — before any .read() calls consume the stream ─
+    file_sizes: dict[str, int] = {
+        f.filename: (f.size or 0)
+        for f in files
+    }
+
+    # ── Save original PDFs for the viewer ─────────────────────────────────────
     pdfs_dir = Path(settings.qdrant_path).parent / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     for file in files:
@@ -537,7 +549,7 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
 
     tmp_dir    = Path("/tmp") / f"rag_admin_ingest_{uuid.uuid4().hex}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    file_paths : list[tuple[str, str]] = []
+    file_paths: list[tuple[str, str]] = []
 
     try:
         for upload in files:
@@ -546,7 +558,6 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
             tmp_path.write_bytes(content)
             file_paths.append((str(tmp_path), upload.filename))
 
-        # Pass tenant_slug so _ingest_files_sync uses tenant-scoped stores
         result = await run_in_threadpool(
             _ingest_files_sync, file_paths, tenant_slug
         )
@@ -554,11 +565,59 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    # ── POST-FLIGHT: Usage accounting ─────────────────────────────────────────
+    # Mirrors the accounting in POST /ingest (ingest.py Phase 3).
+    # _ingest_files_sync already returns file_chunks (per-file counts) so
+    # no extra Qdrant query is needed.
+    actual_chunks  = result["total_chunks"]
+    file_chunk_map = result.get("file_chunks", {})
+
+    supabase = get_supabase_admin()
+    plan_svc = PlanService(supabase)
+
+    if actual_chunks > 0:
+        try:
+            await run_in_threadpool(
+                plan_svc.increment_vectors, tenant_id, actual_chunks
+            )
+            logger.info(
+                "[ADMIN/INGEST] Vector count incremented — tenant=%s  +%d chunks",
+                tenant_slug, actual_chunks,
+            )
+        except Exception as exc:
+            logger.error(
+                "[ADMIN/INGEST] increment_vectors failed — tenant=%s: %s",
+                tenant_slug, exc,
+            )
+
+    for filename in result["files_indexed"]:
+        chunk_count = file_chunk_map.get(filename, 0)
+        file_size   = file_sizes.get(filename)
+        try:
+            await run_in_threadpool(
+                plan_svc.record_document,
+                tenant_id,
+                tenant_slug,
+                filename,
+                chunk_count,
+                file_size,
+                "success",
+            )
+            logger.info(
+                "[ADMIN/INGEST] Document recorded — tenant=%s  file=%s  chunks=%d",
+                tenant_slug, filename, chunk_count,
+            )
+        except Exception as exc:
+            logger.error(
+                "[ADMIN/INGEST] record_document failed — tenant=%s  file=%s: %s",
+                tenant_slug, filename, exc,
+            )
+
     logger.info(
         "[ADMIN/INGEST] ✅ tenant=%s  files=%s  chunks=%d",
         tenant_slug,
         result["files_indexed"],
-        result["total_chunks"],
+        actual_chunks,
     )
 
     return IngestResponse(
@@ -571,7 +630,6 @@ async def admin_ingest(request: Request, files: list[UploadFile] = File(...)):
             f"Skipped {len(result['skipped'])} duplicate(s)."
         ),
     )
-
 
 # ── DELETE /admin/file/{filename} ─────────────────────────────────────────────
 
@@ -723,6 +781,50 @@ async def admin_stats(request: Request):
         tenant_slug, stats["total_vectors"], stats["bm25_docs"],
     )
     return stats
+
+
+# ── POST /admin/onboarding-complete ──────────────────────────────────────────
+#
+# Called by OnboardingPage after the wizard finishes.
+# Sets app_metadata.onboarding_complete = True on the Supabase auth user
+# so the frontend JWT (after refreshSession) picks up the flag and
+# isOnboardingComplete() returns True.
+
+@router.post("/onboarding-complete")
+async def admin_onboarding_complete(request: Request):
+    """
+    Mark onboarding as complete for the current admin user.
+
+    Updates Supabase auth.users app_metadata with onboarding_complete: true.
+    The frontend calls supabase.auth.refreshSession() after this so the new
+    JWT carries the flag and AuthRedirect stops sending the user to /onboarding.
+
+    Returns:
+        { "message": "Onboarding complete." }
+    """
+    user_id = request.state.user_id
+    sb      = get_supabase_admin()
+
+    try:
+        sb.auth.admin.update_user_by_id(
+            user_id,
+            {"app_metadata": {"onboarding_complete": True}},
+        )
+        logger.info(
+            "[ADMIN/ONBOARDING] ✅ Marked complete — user=%s  tenant=%s",
+            user_id, request.state.tenant_slug,
+        )
+    except Exception as exc:
+        logger.error(
+            "[ADMIN/ONBOARDING] Failed to set onboarding flag — user=%s: %s",
+            user_id, exc,
+        )
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail      = "Could not complete onboarding. Please try again.",
+        )
+
+    return {"message": "Onboarding complete."}
 
 
 __all__ = ["router"]
