@@ -504,6 +504,8 @@ async def admin_usage(request: Request):
         "status"       : tenant.get("status"),
         "plan"         : plan.get("name"),
         "plan_id"      : plan.get("id"),
+        "display_name" : request.state.tenant.get("display_name", ""),
+        "slug"         : request.state.tenant_slug,
         "trial_ends_at": tenant.get("trial_ends_at"),
         "last_ingestion": last_ingestion,
     }
@@ -723,6 +725,50 @@ async def admin_stats(request: Request):
         tenant_slug, stats["total_vectors"], stats["bm25_docs"],
     )
     return stats
+
+
+# ── POST /admin/onboarding-complete ──────────────────────────────────────────
+#
+# Called by OnboardingPage after the wizard finishes.
+# Sets app_metadata.onboarding_complete = True on the Supabase auth user
+# so the frontend JWT (after refreshSession) picks up the flag and
+# isOnboardingComplete() returns True.
+
+@router.post("/onboarding-complete")
+async def admin_onboarding_complete(request: Request):
+    """
+    Mark onboarding as complete for the current admin user.
+
+    Updates Supabase auth.users app_metadata with onboarding_complete: true.
+    The frontend calls supabase.auth.refreshSession() after this so the new
+    JWT carries the flag and AuthRedirect stops sending the user to /onboarding.
+
+    Returns:
+        { "message": "Onboarding complete." }
+    """
+    user_id = request.state.user_id
+    sb      = get_supabase_admin()
+
+    try:
+        sb.auth.admin.update_user_by_id(
+            user_id,
+            {"app_metadata": {"onboarding_complete": True}},
+        )
+        logger.info(
+            "[ADMIN/ONBOARDING] ✅ Marked complete — user=%s  tenant=%s",
+            user_id, request.state.tenant_slug,
+        )
+    except Exception as exc:
+        logger.error(
+            "[ADMIN/ONBOARDING] Failed to set onboarding flag — user=%s: %s",
+            user_id, exc,
+        )
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail      = "Could not complete onboarding. Please try again.",
+        )
+
+    return {"message": "Onboarding complete."}
 
 
 __all__ = ["router"]

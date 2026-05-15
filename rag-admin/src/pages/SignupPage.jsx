@@ -53,7 +53,7 @@ export default function SignupPage() {
   try {
     await signup(email.trim(), password, company.trim())
     // Signup done — send them to login (or /plans if you want plan selection first)
-    navigate('/login', { replace: true })
+    navigate('/plans', { replace: true })
   } catch (err) {
     setError(err.message)
   } finally {

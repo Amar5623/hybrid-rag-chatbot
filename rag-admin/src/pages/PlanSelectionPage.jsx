@@ -66,9 +66,9 @@ export default function PlanSelectionPage() {
       return
     }
     setSelecting(plan.id)
-    // For Starter: backend will have set plan on tenant creation.
-    // Just navigate to onboarding.
-    setTimeout(() => navigate('/login', { replace: true }), 400)
+    // Navigate to payment page (bypass placeholder for now).
+    // Pass planId as router state so PaymentPage can display the selected plan.
+    setTimeout(() => navigate('/payment', { replace: true, state: { planId: plan.id } }), 400)
   }
 
   return (

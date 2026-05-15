@@ -15,6 +15,7 @@ import LoginPage from './pages/LoginPage'
 import SignupPage from './pages/SignupPage'
 import VerifyEmailPage from './pages/VerifyEmailPage'
 import PlanSelectionPage from './pages/PlanSelectionPage'
+import PaymentPage from './pages/PaymentPage'
 import OnboardingPage from './pages/OnboardingPage'
 import DashboardPage from './pages/DashboardPage'
 
@@ -53,15 +54,16 @@ function AuthRedirect() {
     const path = location.pathname
 
     // 1. Not authenticated → only public routes allowed
+    // /plans and /payment are public — user is not yet logged in when visiting them
     if (!isAuthenticated) {
-      if (!['/login', '/signup', '/verify'].includes(path)) {
+      if (!['/login', '/signup', '/verify', '/plans', '/payment'].includes(path)) {
         navigate('/login', { replace: true })
       }
       return
     }
 
-    // 2. Authenticated – redirect away from login/signup/verify
-    if (['/login', '/signup', '/verify'].includes(path)) {
+    // 2. Authenticated – redirect away from auth/pre-auth pages
+    if (['/login', '/signup', '/verify', '/payment'].includes(path)) {
       // Send to appropriate destination based on tenant state
       if (!tenant?.slug) {
         navigate('/plans', { replace: true })
@@ -116,6 +118,7 @@ export default function App() {
         <Route path="/signup" element={<SignupPage />} />
         <Route path="/verify" element={<VerifyEmailPage />} />
         <Route path="/plans" element={<PlanSelectionPage />} />
+        <Route path="/payment" element={<PaymentPage />} />
 
         {/* Protected */}
         <Route
