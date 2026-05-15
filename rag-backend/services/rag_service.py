@@ -55,43 +55,69 @@ _lock = threading.Lock()
 _tasks: dict = {}
 
 # ── Per-tenant store cache (Phase 1 — Multi-Tenancy) ─────────────────────────
+#
+# WHY two separate dicts instead of @lru_cache:
+#   lru_cache keys only on the argument (tenant_slug).  The correct store
+#   mode (cloud vs local) depends on runtime connectivity — something that
+#   can change after the first call.  If a tenant store is cached in local
+#   mode when the server starts offline, it would stay local forever even
+#   after the network comes up.
+#
+#   Two dicts let us cache cloud stores and local stores independently:
+#     - online  → cloud dict (each entry is a cloud-connected QdrantVectorStore)
+#     - offline → local dict (each entry shares the singleton local client)
+#   When connectivity flips, the next ingest/query picks up the right dict.
+#
+# Thread-safety: same as the old lru_cache — CPython dict operations are
+# atomic under the GIL for simple get/set.  No mutation happens after the
+# initial write for a given key, so races are benign.
 
-@_lru_cache(maxsize=100)   # holds up to 100 tenant (vector_store, bm25) pairs
+_tenant_stores_cloud: dict[str, tuple] = {}
+_tenant_stores_local: dict[str, tuple] = {}
+
+
 def get_tenant_stores(tenant_slug: str):
     """
     Return a (vector_store, bm25_store) pair scoped to the given tenant.
 
-    Results are cached per slug for the process lifetime so repeated requests
-    from the same tenant reuse the same store instances (no reconnect overhead).
+    Store selection logic:
+      - If a cloud store is configured AND the network monitor reports online
+        → use cloud mode (writes go to Qdrant Cloud)
+      - Otherwise
+        → use local mode (writes go to local on-disk Qdrant via shared client)
 
-    The lru_cache is keyed on tenant_slug (a plain string) — thread-safe in
-    CPython because lru_cache uses an internal lock.
+    Results are cached per (mode, slug) so repeated requests from the same
+    tenant in the same connectivity state reuse the same instances.
 
     Args:
         tenant_slug: Tenant identifier derived from request.state.tenant_slug.
 
     Returns:
         (BaseVectorStore, BM25Store) — both scoped to this tenant.
-
-    Example:
-        vs, bm25 = get_tenant_stores("acme_shipping")
-        # vs  → Qdrant collection "rag_docs_acme_shipping"
-        # bm25 → data/bm25/bm25_acme_shipping.pkl
     """
     from vectorstore.factory import get_vector_store as _factory_get_store
     from retrieval.bm25_store import BM25Store
 
-    vs   = _factory_get_store(
-        vendor      = settings.vector_store_vendor,
-        mode        = "local",
-        embedder    = _embedder,        # reuse the global singleton embedder
-        tenant_slug = tenant_slug,
-    )
-    bm25 = BM25Store(tenant_slug=tenant_slug)
+    # Decide mode based on live connectivity + cloud store availability.
+    use_cloud = (_cloud_store is not None and is_online())
+    mode      = "cloud" if use_cloud else "local"
+    cache     = _tenant_stores_cloud if use_cloud else _tenant_stores_local
 
-    print(f"  [SERVICE] get_tenant_stores('{tenant_slug}') — stores initialised")
-    return vs, bm25
+    if tenant_slug not in cache:
+        print(f"  [SERVICE] get_tenant_stores('{tenant_slug}', mode='{mode}') — initialising")
 
+        vs = _factory_get_store(
+            vendor      = settings.vector_store_vendor,
+            mode        = mode,          # ← was hardcoded "local"; now dynamic
+            embedder    = _embedder,     # reuse the global singleton embedder
+            tenant_slug = tenant_slug,
+        )
+        bm25 = BM25Store(tenant_slug=tenant_slug)
+        cache[tenant_slug] = (vs, bm25)
+    else:
+        print(f"  [SERVICE] get_tenant_stores('{tenant_slug}', mode='{mode}') — cache hit")
+
+    return cache[tenant_slug]
 
 # ── HYBRID STORE ACCESSOR ─────────────────────────────────────────────────────
 
